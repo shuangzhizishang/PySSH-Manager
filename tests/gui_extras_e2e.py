@@ -10,10 +10,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import tempfile
 import time
 from pathlib import Path
+
+# 测试必须与真实数据目录隔离，避免污染主机列表与凭据
+os.environ.setdefault("PYSSH_DATA_DIR", tempfile.mkdtemp(prefix="pyssh-extras-"))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
