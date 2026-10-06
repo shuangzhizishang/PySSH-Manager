@@ -1,0 +1,15 @@
+# 虚拟环境
+.venv/
+venv/
+
+# PyCharm
+.idea/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 运行期数据（主机列表、凭据）不进版本库
+data/
+*.log

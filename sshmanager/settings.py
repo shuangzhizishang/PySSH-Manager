@@ -1,0 +1,52 @@
+"""应用路径与全局常量。"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+APP_NAME = "PySSH Manager"
+APP_SLUG = "PySSH-Manager"
+
+#: 允许通过环境变量覆盖数据目录，方便测试
+ENV_DATA_DIR = "PYSSH_DATA_DIR"
+
+
+def data_dir() -> Path:
+    """返回存放主机列表与凭据的目录，不存在时自动创建。"""
+
+    override = os.environ.get(ENV_DATA_DIR)
+
+    if override:
+        path = Path(override).expanduser()
+    elif os.name == "nt":
+        base = os.environ.get("APPDATA") or str(Path.home())
+        path = Path(base) / APP_SLUG
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+        path = Path(base) / APP_SLUG
+
+    path.mkdir(parents=True, exist_ok=True)
+
+    return path
+
+
+def hosts_file() -> Path:
+    return data_dir() / "hosts.json"
+
+
+def credentials_file() -> Path:
+    return data_dir() / "credentials.json"
+
+
+def legacy_known_hosts_file() -> Path:
+    """应用自带的 known_hosts，避免污染用户全局 ~/.ssh。"""
+
+    return data_dir() / "known_hosts"
+
+
+DEFAULT_COLUMNS = 120
+DEFAULT_ROWS = 32
+
+DEFAULT_FONT_FAMILY = "Consolas"
+DEFAULT_FONT_SIZE = 12
