@@ -7,6 +7,7 @@ from pathlib import Path
 from PySide6.QtCore import QDir, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QFileSystemModel,
     QHBoxLayout,
     QHeaderView,
@@ -310,6 +311,11 @@ class SftpPanel(QWidget):
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.worker_cancel)
 
+        self.resume_check = QCheckBox("断点续传")
+        self.resume_check.setChecked(True)
+        self.resume_check.setToolTip("传输中断后重试时只补缺失的部分（下载用 .part 临时文件）")
+        self.resume_check.toggled.connect(self._on_resume_toggled)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setMaximumWidth(220)
         self.progress_bar.setVisible(False)
@@ -319,10 +325,14 @@ class SftpPanel(QWidget):
         row.addWidget(self.mkdir_button)
         row.addWidget(self.delete_button)
         row.addWidget(self.cancel_button)
+        row.addWidget(self.resume_check)
         row.addStretch()
         row.addWidget(self.progress_bar)
 
         return bar
+
+    def _on_resume_toggled(self, checked: bool) -> None:
+        self.worker.resume = bool(checked)
 
     # ==================================================================
     # 连接状态

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -38,6 +38,7 @@ from ..sshclient import SSHClient
 from .forward_dialog import ForwardDialog
 from .host_dialog import HostDialog
 from .key_dialog import KeyManagerDialog
+from .replay_dialog import ReplayDialog
 from .session_tab import LocalTerminalTab, SessionTab
 from .sftp_panel import SftpPanel
 from .split_tab import SplitTerminalTab
@@ -75,7 +76,12 @@ class MainWindow(QMainWindow):
         self.tabs: dict[str, SessionTab | SplitTerminalTab] = {}
         self.sftp_tabs: dict[str, SftpPanel] = {}
         self.local_tabs: dict[str, LocalTerminalTab] = {}
+        self.replay_dialog = None
         self._quitting = False
+
+        self.record_timer = QTimer(self)
+        self.record_timer.setInterval(1000)
+        self.record_timer.timeout.connect(self._on_record_tick)
 
         self.setWindowTitle(f"{APP_NAME} {__version__}")
         self.resize(1180, 720)
@@ -142,6 +148,19 @@ class MainWindow(QMainWindow):
         self.action_keys.setShortcut(QKeySequence("Ctrl+Shift+K"))
         self.action_keys.triggered.connect(self.manage_keys)
 
+        self.action_record = QAction("开始录制会话", self)
+        self.action_record.setShortcut(QKeySequence("Ctrl+Shift+R"))
+        self.action_record.triggered.connect(self.toggle_recording)
+
+        self.action_replay = QAction("回放录制…", self)
+        self.action_replay.triggered.connect(self.open_replay)
+
+        self.action_sync = QAction("配置同步…", self)
+        self.action_sync.triggered.connect(self.sync_config)
+
+        self.action_import_ppk = QAction("导入 PuTTY 密钥…", self)
+        self.action_import_ppk.triggered.connect(self.import_ppk)
+
         self.action_close_tab = QAction("关闭标签", self)
         self.action_close_tab.setShortcut(QKeySequence("Ctrl+W"))
         self.action_close_tab.triggered.connect(self.close_current_tab)
@@ -185,6 +204,9 @@ class MainWindow(QMainWindow):
         menu.addAction(self.action_forwards)
         menu.addAction(self.action_local)
         menu.addSeparator()
+        menu.addAction(self.action_record)
+        menu.addAction(self.action_replay)
+        menu.addSeparator()
         menu.addAction(self.action_split_h)
         menu.addAction(self.action_split_v)
         menu.addAction(self.action_focus_next)
@@ -201,6 +223,8 @@ class MainWindow(QMainWindow):
         hosts_menu.addAction(self.action_export)
         hosts_menu.addSeparator()
         hosts_menu.addAction(self.action_keys)
+        hosts_menu.addAction(self.action_import_ppk)
+        hosts_menu.addAction(self.action_sync)
 
         edit_menu = self.menuBar().addMenu("编辑")
         edit_menu.addAction(self.action_copy)
@@ -208,8 +232,11 @@ class MainWindow(QMainWindow):
 
         self.host_list = QListWidget()
         self.host_list.setMinimumWidth(220)
+        self.host_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.host_list.itemDoubleClicked.connect(lambda _item: self.connect_selected())
         self.host_list.currentItemChanged.connect(self._on_host_selected)
+        self.host_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.host_list.customContextMenuRequested.connect(self._show_host_menu)
 
         self.tabs_widget = QTabWidget()
         self.tabs_widget.setTabsClosable(True)
@@ -297,6 +324,30 @@ class MainWindow(QMainWindow):
 
         return self.context.hosts.get(item.data(STATE_ROLE))
 
+    def _show_host_menu(self, position) -> None:
+        """主机列表右键菜单（支持多选批量操作）。"""
+
+        hosts = self._selected_hosts()
+
+        if not hosts:
+            return
+
+        from PySide6.QtWidgets import QMenu
+
+        menu = QMenu(self)
+        single = len(hosts) == 1
+
+        menu.addAction("连接", self.connect_selected)
+        menu.addAction(f"连接选中的 {len(hosts)} 台", self.connect_selected_hosts)
+        menu.addSeparator()
+        menu.addAction("编辑主机", self.edit_host).setEnabled(single)
+        menu.addAction("SFTP 文件", self.open_sftp).setEnabled(single)
+        menu.addAction("端口转发", self.open_forwards).setEnabled(single)
+        menu.addSeparator()
+        menu.addAction("断开选中会话", self.disconnect_selected_hosts)
+        menu.addAction(f"删除选中的 {len(hosts)} 台", self.delete_selected_hosts)
+        menu.exec(self.host_list.viewport().mapToGlobal(position))
+
     def _on_host_selected(self, *_args) -> None:
         host = self._selected_host()
 
@@ -358,12 +409,17 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已更新主机 {updated.display_name}")
 
     def delete_host(self) -> None:
-        host = self._selected_host()
+        hosts = self._selected_hosts()
 
-        if host is None:
+        if not hosts:
             QMessageBox.information(self, APP_NAME, "请先在左侧选择一台主机。")
             return
 
+        if len(hosts) > 1:
+            self.delete_selected_hosts()
+            return
+
+        host = hosts[0]
         confirm = QMessageBox.question(
             self,
             APP_NAME,
@@ -548,6 +604,252 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         dialog.exec()
+
+    # ------------------------------------------------------------------
+    # 会话录制 / 回放
+    # ------------------------------------------------------------------
+
+    def toggle_recording(self) -> None:
+        pane = self._focused_terminal()
+
+        if pane is None:
+            self.statusBar().showMessage("请先打开一个终端标签")
+            return
+
+        if pane.recording:
+            path = pane.stop_recording()
+            self.action_record.setText("开始录制会话")
+            self.record_timer.stop()
+
+            if path is not None:
+                self.statusBar().showMessage(f"录制已保存：{path}")
+
+            self._update_title()
+            return
+
+        from ..recording import default_recordings_dir, suggest_filename
+
+        directory = default_recordings_dir()
+        suggested = directory / suggest_filename(pane.display_name)
+        path, _ = QFileDialog.getSaveFileName(self, "保存录制", str(suggested), "asciicast 录制 (*.cast)")
+
+        if not path:
+            return
+
+        pane.start_recording(Path(path))
+        self.action_record.setText("停止录制")
+        self.record_timer.start()
+        self.statusBar().showMessage(f"正在录制：{path}")
+
+    def _on_record_tick(self) -> None:
+        pane = self._focused_terminal()
+
+        if pane is None or not pane.recording:
+            self.record_timer.stop()
+            return
+
+        recorder = pane.recorder
+        self.statusBar().showMessage(
+            f"● 录制中 {recorder.elapsed:.0f}s · {recorder.event_count} 事件 · {recorder.byte_count} 字节"
+        )
+
+    def open_replay(self) -> None:
+        if self.replay_dialog is None:
+            self.replay_dialog = ReplayDialog(parent=self)
+
+        self.replay_dialog.show()
+        self.replay_dialog.raise_()
+        self.replay_dialog.activateWindow()
+
+    # ------------------------------------------------------------------
+    # 配置同步 / PPK 导入 / 批量操作
+    # ------------------------------------------------------------------
+
+    def sync_config(self) -> None:
+        from ..sync import export_package, import_package
+
+        folder = QFileDialog.getExistingDirectory(self, "选择同步目录（共享盘 / 网盘同步目录）")
+
+        if not folder:
+            return
+
+        choice = QMessageBox.question(
+            self,
+            "配置同步",
+            "选择同步方向：\n\n是 = 导出到该目录（覆盖目录里的清单）\n否 = 从该目录导入并合并到本地",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+        )
+
+        if choice == QMessageBox.StandardButton.Cancel:
+            return
+
+        if choice == QMessageBox.StandardButton.Yes:
+            include = QMessageBox.question(
+                self,
+                "配置同步",
+                "是否同时导出已保存的密码？\n（用当前 Windows 账户加密，换机器通常无法解密）",
+            ) == QMessageBox.StandardButton.Yes
+
+            try:
+                path = export_package(
+                    Path(folder),
+                    self.context.hosts.sorted_hosts(),
+                    credentials=self.context.credentials,
+                    include_credentials=include,
+                )
+            except OSError as error:
+                QMessageBox.warning(self, APP_NAME, f"导出失败：{error}")
+                return
+
+            QMessageBox.information(self, APP_NAME, f"已导出 {len(self.context.hosts.hosts)} 台主机到：\n{path}")
+            self.statusBar().showMessage(f"配置已导出到 {path}")
+            return
+
+        result = import_package(Path(folder), self.context.hosts.hosts, self.context.credentials)
+        self.context.hosts.save()
+        self.refresh_hosts()
+        QMessageBox.information(self, APP_NAME, result.summary("导入完成"))
+        self.statusBar().showMessage(result.summary("配置同步"))
+
+    def import_ppk(self) -> None:
+        from ..keygen import KeyError_ as KeyGenError
+        from ..ppk import PPKError, convert_ppk, parse_ppk
+
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "导入 PuTTY 密钥",
+            str(Path.home()),
+            "PuTTY 密钥 (*.ppk);;所有文件 (*)",
+        )
+
+        if not paths:
+            return
+
+        store = self.context.key_store()
+        imported = 0
+        errors: list[str] = []
+
+        for path_text in paths:
+            path = Path(path_text)
+
+            try:
+                meta = parse_ppk(path)
+                passphrase = ""
+
+                if meta.encrypted:
+                    text, ok = QInputDialog.getText(
+                        self,
+                        "导入 PuTTY 密钥",
+                        f"{path.name} 已加密，请输入 passphrase：",
+                        QInputDialog.EchoMode.Password,
+                    )
+
+                    if not ok:
+                        continue
+
+                    passphrase = text
+
+                private_key, comment = convert_ppk(path, passphrase)
+
+                from ..keygen import ManagedKey, public_key_text
+
+                filename = f"ppk-{path.stem}"
+                target = store.directory / filename
+                counter = 1
+
+                while target.exists():
+                    filename = f"ppk-{path.stem}-{counter}"
+                    target = store.directory / filename
+                    counter += 1
+
+                private_key.write_private_key_file(str(target))
+
+                key = ManagedKey(
+                    name=path.stem,
+                    key_type="rsa" if meta.key_type == "ssh-rsa" else "ed25519",
+                    comment=comment or path.stem,
+                    filename=filename,
+                )
+                store.add(key)
+                key.public_path.write_text(f"{public_key_text(private_key)} {key.comment}\n", encoding="utf-8")
+                imported += 1
+            except (PPKError, KeyGenError) as error:
+                errors.append(f"{path.name}：{error}")
+            except Exception as error:  # noqa: BLE001
+                errors.append(f"{path.name}：{error}")
+
+        message = f"已导入 {imported} 个密钥到密钥目录。"
+
+        if errors:
+            message += "\n\n失败：\n" + "\n".join(errors[:5])
+
+        QMessageBox.information(self, APP_NAME, message)
+        self.statusBar().showMessage(f"导入 PuTTY 密钥 {imported} 个")
+
+    def _selected_hosts(self) -> list[Host]:
+        """当前选中的主机（支持多选）。"""
+
+        hosts = []
+
+        for item in self.host_list.selectedItems():
+            host_id = item.data(STATE_ROLE)
+            host = self.context.hosts.get(host_id) if host_id else None
+
+            if host is not None:
+                hosts.append(host)
+
+        return hosts
+
+    def connect_selected_hosts(self) -> None:
+        """批量连接选中的主机（依次错开 300ms，避免同时握手）。"""
+
+        hosts = self._selected_hosts()
+
+        if not hosts:
+            self.statusBar().showMessage("请先在左侧选择主机（可按住 Ctrl 多选）")
+            return
+
+        for index, host in enumerate(hosts):
+            QTimer.singleShot(index * 300, lambda h=host: self.connect_host(h))
+
+        self.statusBar().showMessage(f"正在连接 {len(hosts)} 台主机…")
+
+    def disconnect_selected_hosts(self) -> None:
+        hosts = self._selected_hosts()
+        closed = 0
+
+        for host in hosts:
+            tab = self.tabs.get(host.id)
+
+            if tab is None:
+                continue
+
+            index = self.tabs_widget.indexOf(tab)
+
+            if index >= 0:
+                self.close_tab(index)
+                closed += 1
+
+        self.statusBar().showMessage(f"已断开 {closed} 台主机的会话")
+
+    def delete_selected_hosts(self) -> None:
+        hosts = self._selected_hosts()
+
+        if not hosts:
+            return
+
+        names = "、".join(host.display_name for host in hosts[:5])
+        confirm = QMessageBox.question(self, APP_NAME, f"删除 {len(hosts)} 台主机（{names}）及其保存的密码？")
+
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        for host in hosts:
+            self.context.credentials.delete(host.id)
+            self.context.hosts.remove(host.id)
+
+        self.refresh_hosts()
+        self.statusBar().showMessage(f"已删除 {len(hosts)} 台主机")
 
     # ------------------------------------------------------------------
     # 本地终端 / 分屏

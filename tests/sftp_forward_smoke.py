@@ -181,7 +181,7 @@ def main() -> int:
         source = workspace_path / "hello.txt"
         source.write_text(PAYLOAD, encoding="utf-8")
 
-        uploaded = sftp.upload(source, remote_file)
+        uploaded, _resumed = sftp.upload(source, remote_file)
         results["upload"] = uploaded == source.stat().st_size
         print(f"2. 上传 {uploaded} 字节到 {remote_file}", flush=True)
 

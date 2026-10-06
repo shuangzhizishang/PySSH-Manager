@@ -61,6 +61,7 @@ class TerminalTab(QWidget):
 
         self._closing = False
         self.status_hint = "○ 正在连接..."
+        self.recorder = None
 
         self.view = TerminalView()
         self.view.data_to_send.connect(self._on_input)
@@ -93,7 +94,9 @@ class TerminalTab(QWidget):
     def start(self) -> None:
         self.session = self._create_session()
 
-        self.session.data_received.connect(self.view.feed)
+        # 先包一层：录制输出要与喂给终端的是同一份数据
+        self.session.data_received.connect(self._on_output)
+
         self.session.connected.connect(self._on_connected)
         self.session.failed.connect(self._on_failed)
         self.session.disconnected.connect(self._on_disconnected)
@@ -101,6 +104,56 @@ class TerminalTab(QWidget):
         self.session.start()
 
         QTimer.singleShot(0, self.view.setFocus)
+
+    def _on_output(self, data: bytes) -> None:
+        """服务器输出：喂给终端 +（可选）写入录制。"""
+
+        self.view.feed(data)
+
+        if self.recorder is not None and self.recorder.active:
+            try:
+                self.recorder.write_output(data)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # 会话录制
+    # ------------------------------------------------------------------
+
+    def start_recording(self, path, width: int | None = None, height: int | None = None):
+        """开始录制，返回录制文件路径。"""
+
+        from ..recording import CastRecorder
+
+        if self.recorder is not None and self.recorder.active:
+            return self.recorder.path
+
+        self.recorder = CastRecorder(
+            path,
+            width=width or self.view.emulator.columns,
+            height=height or self.view.emulator.lines,
+            title=self.display_name,
+        )
+        self.recorder.start()
+
+        return self.recorder.path
+
+    def stop_recording(self):
+        if self.recorder is None or not self.recorder.active:
+            return None
+
+        return self.recorder.stop()
+
+    @property
+    def recording(self) -> bool:
+        return self.recorder is not None and self.recorder.active
+
+    def _record_resize(self, columns: int, rows: int) -> None:
+        if self.recorder is not None and self.recorder.active:
+            try:
+                self.recorder.write_resize(columns, rows)
+            except Exception:
+                pass
 
     def _create_session(self):
         if self.is_local:
@@ -143,6 +196,7 @@ class TerminalTab(QWidget):
 
     def close(self) -> None:
         self._closing = True
+        self.stop_recording()
         self._stop_session()
 
     # ------------------------------------------------------------------
@@ -151,9 +205,17 @@ class TerminalTab(QWidget):
         if self.session is not None:
             self.session.send(data)
 
+        if self.recorder is not None and self.recorder.active:
+            try:
+                self.recorder.write_input(data)
+            except Exception:
+                pass
+
     def _on_resized(self, columns: int, rows: int) -> None:
         if self.session is not None:
             self.session.set_terminal_size(columns, rows)
+
+        self._record_resize(columns, rows)
 
     def _on_title(self, title: str) -> None:
         if title:

@@ -51,6 +51,9 @@ class SftpWorker(QThread):
         self._abort = threading.Event()
         self._cancel = threading.Event()
 
+        #: 是否对文件传输启用断点续传（由界面切换）
+        self.resume = False
+
     # ------------------------------------------------------------------
     # 界面接口
     # ------------------------------------------------------------------
@@ -159,16 +162,19 @@ class SftpWorker(QThread):
                         local_path,
                         progress=on_progress,
                         cancelled=self._cancel.is_set,
+                        resume=self.resume,
                     )
                     self.task_finished.emit("下载目录", True, f"{name}（{files} 个文件，{size} 字节）")
                 else:
-                    size = self._sftp.download(
+                    size, resumed = self._sftp.download(
                         remote_path,
                         local_path,
                         progress=on_progress,
                         cancelled=self._cancel.is_set,
+                        resume=self.resume,
                     )
-                    self.task_finished.emit("下载", True, f"{local_path.name}（{size} 字节）")
+                    suffix = "（续传）" if resumed else ""
+                    self.task_finished.emit("下载", True, f"{local_path.name}{suffix}（{size} 字节）")
 
                 return
 
@@ -184,16 +190,19 @@ class SftpWorker(QThread):
                         remote_path,
                         progress=on_upload_progress,
                         cancelled=self._cancel.is_set,
+                        resume=self.resume,
                     )
                     self.task_finished.emit("上传目录", True, f"{local_path.name}（{files} 个文件，{size} 字节）")
                 else:
-                    size = self._sftp.upload(
+                    size, resumed = self._sftp.upload(
                         local_path,
                         remote_path,
                         progress=on_upload_progress,
                         cancelled=self._cancel.is_set,
+                        resume=self.resume,
                     )
-                    self.task_finished.emit("上传", True, f"{remote_path}（{size} 字节）")
+                    suffix = "（续传）" if resumed else ""
+                    self.task_finished.emit("上传", True, f"{remote_path}{suffix}（{size} 字节）")
 
                 return
 

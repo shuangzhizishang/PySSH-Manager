@@ -131,10 +131,16 @@ class Emulator:
     # ------------------------------------------------------------------
 
     def feed(self, data: bytes | str) -> None:
-        """喂入服务器输出。"""
+        """喂入服务器输出。
+
+        ``str`` 会被编码成 UTF-8 字节再解析，保持与 ``ByteStream`` 一致的解码语义。
+        """
 
         if not data:
             return
+
+        if isinstance(data, str):
+            data = data.encode("utf-8", errors="replace")
 
         self._stream.feed(data)
 

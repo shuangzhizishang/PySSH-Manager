@@ -199,6 +199,11 @@ class KeyStore:
 
         return public_key_text(private_key)
 
+    def public_path_for(self, key: ManagedKey) -> Path:
+        """公钥文件路径（导入外部密钥时用）。"""
+
+        return key.public_path
+
     def deploy_public_key(self, ssh_client, key: ManagedKey, passphrase: str | None = None) -> str:
         """把公钥追加到远端 ``~/.ssh/authorized_keys``（幂等）。"""
 

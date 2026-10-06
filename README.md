@@ -20,10 +20,17 @@
 - **分屏**：左右 / 上下分屏，最多 4 个面板，每个面板是独立的 SSH 会话，分隔条可拖动调整
 - **SFTP 文件管理**：双栏（本地 / 远端）浏览，上传、下载、新建目录、重命名、删除；
   **支持拖拽**（本地文件/目录拖到远端即上传，远端条目拖到本地即下载）与**目录递归传输**，
-  传输带进度条与取消
+  传输带进度条与取消；**断点续传**（下载写 `.part` 临时文件，成功后原子替换；
+  重试只补缺失字节）
+- **会话录制与回放**：录制为 asciicast v2 格式（可直接用 `asciinema play` 播放），
+  应用内回放器支持播放 / 暂停 / 倍速 / 时间轴拖动
 - **SSH 密钥管理**：生成 Ed25519 / RSA 密钥（私钥可用口令加密）、查看/复制公钥、
   一键把公钥部署到远端 `~/.ssh/authorized_keys`（幂等）、打开密钥目录
-- **主机分组与标签**：主机可打多个标签，侧边栏按第一个标签分组显示
+- **PuTTY 密钥导入**：解析 `.ppk`（v2/v3、`ssh-rsa`/`ssh-ed25519`），转成应用密钥；
+  加密 ppk 需提供 passphrase（v3 的 Argon2 需要 `argon2-cffi`）
+- **主机分组与标签**：主机可打多个标签，侧边栏按第一个标签分组显示；支持多选批量连接/断开/删除
+- **配置同步**：把主机清单导出/合并到一个共享目录（网盘/共享盘），
+  可选带上加密凭据；合并时按最近连接时间取较新版本，并保留本地 id 以免凭据失联
 - **端口转发（三类）**：
   - 本地转发 `ssh -L`：本机端口 → 服务器可达的目标
   - 远端转发 `ssh -R`：服务器监听端口 → 本机服务
@@ -33,7 +40,8 @@
   导入时解析 `ProxyJump` 并自动关联跳板机，别名里的 `-` 前缀会作为分组标签
 - **快捷键**：`Ctrl+N` 新建、`Ctrl+Enter` 连接、`Ctrl+R` 重连、`Ctrl+W` 关标签、
   `Ctrl+Shift+F` SFTP、`Ctrl+Shift+P` 端口转发、`Ctrl+Shift+T` 本地终端、
-  `Ctrl+Shift+K` 密钥管理、`Ctrl+Shift+E` 左右分屏、`Ctrl+Shift+O` 上下分屏、
+  `Ctrl+Shift+K` 密钥管理、`Ctrl+Shift+R` 开始/停止录制、
+  `Ctrl+Shift+E` 左右分屏、`Ctrl+Shift+O` 上下分屏、
   `Ctrl+Shift+W` 切换分屏焦点、`Ctrl+Shift+C/V` 复制粘贴、
   `Ctrl+ +/-/0` 字体缩放、`Ctrl+鼠标滚轮` 缩放
 
@@ -73,6 +81,9 @@ sshmanager/
   hosts.py                  Host 数据模型 + HostStore 持久化
   hostio.py                 主机导入导出（OpenSSH config / JSON / ProxyJump / 标签）
   keygen.py                 SSH 密钥生成与管理（Ed25519 / RSA、加密、部署公钥）
+  ppk.py                    PuTTY .ppk 导入（v2/v3、RSA/Ed25519、Argon2）
+  sync.py                   配置同步（共享目录合并 + 可选加密凭据）
+  recording.py              会话录制与读取（asciicast v2）
   sshclient.py              paramiko 封装：socket+Transport 自管、认证、指纹校验、SFTP
   session.py                SSHSession（QThread）：连接、读取、断开
   localsession.py           本地终端会话（ConPTY / pywinpty）
@@ -90,6 +101,7 @@ sshmanager/
     sftp_panel.py           SFTP 双栏面板（含拖拽与递归传输）
     forward_dialog.py       端口转发管理对话框（三种类型）
     key_dialog.py           密钥管理对话框
+    replay_dialog.py        录制回放对话框
 tests/
   test_terminal.py          终端仿真核心单测
   test_terminal_view.py     滚动与排版回归测试
@@ -98,6 +110,7 @@ tests/
   test_forwarding.py        桥接、SOCKS5、转发规则单测
   test_hostio.py            主机导入导出单测
   test_keygen.py            密钥生成与 ProxyJump / 标签解析单测
+  test_recording_sync_ppk.py 录制、配置同步、PPK 导入单测
   gui_smoke.py              离屏 GUI 冒烟（不需要联网）
   ssh_smoke.py              真实 SSH 冒烟（需要可达的服务器）
   gui_e2e.py                真实 GUI 端到端 + 截图
@@ -107,6 +120,7 @@ tests/
   key_auth_smoke.py         密钥认证验证（本地起 paramiko 服务器，不出网）
   keygen_smoke.py           密钥生成/加载验证（Ed25519/RSA/加密）
   gui_extras_e2e.py         密钥管理 / 标签分组 / 拖拽递归传输 GUI 验证
+  recording_resume_e2e.py   会话录制/回放 + SFTP 断点续传验证
   forward_smoke.py          三种转发真实链路验证（单独跑）
   standalone_remote_forward.py  仅依赖 paramiko 的 -R 最小复现
 ```
@@ -144,6 +158,9 @@ $env:QT_QPA_PLATFORM='offscreen'
 
 # 密钥生成（不需要联网）
 .venv\Scripts\python.exe tests\keygen_smoke.py
+
+# 会话录制/回放 + SFTP 断点续传
+.venv\Scripts\python.exe tests\recording_resume_e2e.py --host 192.168.206.130 --password <密码>
 ```
 
 ## 五个已踩过的坑（改动时注意）

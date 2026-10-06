@@ -247,6 +247,7 @@ class SftpClient:
         remote_dir: str,
         progress=None,
         cancelled=None,
+        resume: bool = False,
     ) -> tuple[int, int]:
         """递归上传目录，返回 ``(文件数, 字节数)``。"""
 
@@ -267,7 +268,7 @@ class SftpClient:
                 self.mkdir_p(target)
                 continue
 
-            written = self.upload(path, target, progress=progress, cancelled=cancelled)
+            written, _resumed = self.upload(path, target, progress=progress, cancelled=cancelled, resume=resume)
             files += 1
             total_bytes += written
 
@@ -279,6 +280,7 @@ class SftpClient:
         local_dir: Path,
         progress=None,
         cancelled=None,
+        resume: bool = False,
     ) -> tuple[int, int]:
         """递归下载目录，返回 ``(文件数, 字节数)``。"""
 
@@ -298,12 +300,19 @@ class SftpClient:
                     local_dir / entry.name,
                     progress=progress,
                     cancelled=cancelled,
+                    resume=resume,
                 )
                 files += sub_files
                 total_bytes += sub_bytes
                 continue
 
-            written = self.download(entry.path, local_dir / entry.name, progress=progress, cancelled=cancelled)
+            written, _resumed = self.download(
+                entry.path,
+                local_dir / entry.name,
+                progress=progress,
+                cancelled=cancelled,
+                resume=resume,
+            )
             files += 1
             total_bytes += written
 
@@ -334,13 +343,18 @@ class SftpClient:
         local_path: Path,
         progress=None,
         cancelled=None,
-    ) -> int:
-        """把远端文件下载到本地，返回字节数。``progress(done, total)`` 可用于进度显示。"""
+        resume: bool = False,
+    ) -> tuple[int, bool]:
+        """把远端文件下载到本地。
+
+        返回 ``(本次写入字节数, 是否为续传)``。
+        ``resume=True`` 时会比较本地已有文件与远端大小，只拉取缺失的尾部：
+        写入临时 ``.part`` 文件，成功后原子替换为目标文件。
+        """
 
         client = self._client()
         local_path = Path(local_path)
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        written = 0
 
         with client.open(normalize_remote_path(remote_path), "rb") as source:
             try:
@@ -348,7 +362,32 @@ class SftpClient:
             except Exception:
                 total = 0
 
-            with open(local_path, "wb") as target:
+            offset = 0
+            partial = local_path.with_name(local_path.name + ".part")
+            resuming = False
+
+            if resume:
+                if partial.exists():
+                    offset = partial.stat().st_size
+                elif local_path.exists():
+                    offset = local_path.stat().st_size
+
+                if total and offset >= total:
+                    # 已经完整，直接把 part 转正
+                    if partial.exists():
+                        partial.replace(local_path)
+                        return 0, True
+
+                    return 0, True
+
+                if offset > 0:
+                    resuming = True
+                    source.seek(offset)
+
+            mode = "ab" if resuming else "wb"
+            written = 0
+
+            with open(partial, mode) as target:
                 while True:
                     if cancelled is not None and cancelled():
                         raise SFTPError("已取消")
@@ -362,9 +401,12 @@ class SftpClient:
                     written += len(chunk)
 
                     if progress is not None:
-                        progress(written, total)
+                        progress(offset + written, total)
 
-        return written
+        # 只有跑完才替换目标文件，避免半截文件覆盖已有内容
+        partial.replace(local_path)
+
+        return written, resuming
 
     def upload(
         self,
@@ -372,16 +414,37 @@ class SftpClient:
         remote_path: str,
         progress=None,
         cancelled=None,
-    ) -> int:
-        """把本地文件上传到远端，返回字节数。"""
+        resume: bool = False,
+    ) -> tuple[int, bool]:
+        """把本地文件上传到远端，返回 ``(本次写入字节数, 是否为续传)``。"""
 
         client = self._client()
         local_path = Path(local_path)
         total = local_path.stat().st_size
+        remote_path = normalize_remote_path(remote_path)
+        offset = 0
+        resuming = False
+
+        if resume:
+            try:
+                remote_size = client.stat(remote_path).st_size or 0
+            except Exception:
+                remote_size = 0
+
+            if total and remote_size >= total:
+                return 0, True
+
+            if remote_size > 0:
+                offset = remote_size
+                resuming = True
+
         written = 0
 
         with open(local_path, "rb") as source:
-            with client.open(normalize_remote_path(remote_path), "wb") as target:
+            if offset:
+                source.seek(offset)
+
+            with client.open(remote_path, "ab" if resuming else "wb") as target:
                 while True:
                     if cancelled is not None and cancelled():
                         raise SFTPError("已取消")
@@ -395,6 +458,6 @@ class SftpClient:
                     written += len(chunk)
 
                     if progress is not None:
-                        progress(written, total)
+                        progress(offset + written, total)
 
-        return written
+        return written, resuming

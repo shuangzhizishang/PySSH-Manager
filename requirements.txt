@@ -11,5 +11,8 @@ cryptography>=42.0
 # 本地终端（Windows 走 ConPTY；仅 Windows 需要）
 pywinpty>=2.0; sys_platform == "win32"
 
+# 导入 PuTTY v3 加密密钥时需要（Argon2 密钥派生）
+argon2-cffi>=21.3
+
 # 测试
 pytest>=8.0
