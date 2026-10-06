@@ -29,12 +29,15 @@ from ..hostio import (
     import_json,
     import_json_credentials,
     parse_openssh_config,
+    resolve_proxy_jumps,
 )
 from ..hosts import Host, HostStore
+from ..keygen import KeyStore
 from ..localsession import conpty_available
 from ..sshclient import SSHClient
 from .forward_dialog import ForwardDialog
 from .host_dialog import HostDialog
+from .key_dialog import KeyManagerDialog
 from .session_tab import LocalTerminalTab, SessionTab
 from .sftp_panel import SftpPanel
 from .split_tab import SplitTerminalTab
@@ -49,6 +52,13 @@ class AppContext:
     hosts: HostStore
     credentials: CredentialStore
     jump_clients: dict[str, SSHClient] = field(default_factory=dict)
+    keys: KeyStore | None = None
+
+    def key_store(self) -> KeyStore:
+        if self.keys is None:
+            self.keys = KeyStore()
+
+        return self.keys
 
     def close(self) -> None:
         for client in self.jump_clients.values():
@@ -128,6 +138,10 @@ class MainWindow(QMainWindow):
         self.action_export = QAction("导出主机…", self)
         self.action_export.triggered.connect(self.export_hosts)
 
+        self.action_keys = QAction("SSH 密钥管理", self)
+        self.action_keys.setShortcut(QKeySequence("Ctrl+Shift+K"))
+        self.action_keys.triggered.connect(self.manage_keys)
+
         self.action_close_tab = QAction("关闭标签", self)
         self.action_close_tab.setShortcut(QKeySequence("Ctrl+W"))
         self.action_close_tab.triggered.connect(self.close_current_tab)
@@ -185,6 +199,8 @@ class MainWindow(QMainWindow):
         hosts_menu.addSeparator()
         hosts_menu.addAction(self.action_import)
         hosts_menu.addAction(self.action_export)
+        hosts_menu.addSeparator()
+        hosts_menu.addAction(self.action_keys)
 
         edit_menu = self.menuBar().addMenu("编辑")
         edit_menu.addAction(self.action_copy)
@@ -225,19 +241,53 @@ class MainWindow(QMainWindow):
 
         self.host_list.clear()
 
+        # 按标签分组显示：有多个分组时插入不可选的分组标题
+        grouped: dict[str, list[Host]] = {}
+
         for host in self.context.hosts.sorted_hosts():
-            item = QListWidgetItem(f"{host.display_name}\n{host.target}")
-            item.setData(STATE_ROLE, host.id)
-            item.setToolTip(f"{host.username}@{host.hostname}:{host.port}")
-            self.host_list.addItem(item)
+            grouped.setdefault(host.group, []).append(host)
 
-            if host.id == selected_id:
-                self.host_list.setCurrentItem(item)
+        show_groups = len(grouped) > 1
 
-        if self.host_list.currentItem() is None and self.host_list.count():
-            self.host_list.setCurrentRow(0)
+        for group in sorted(grouped, key=lambda name: (name == "未分组", name.lower())):
+            if show_groups:
+                header = QListWidgetItem(f"— {group} —")
+                header.setFlags(Qt.ItemFlag.NoItemFlags)
+                header.setForeground(Qt.GlobalColor.gray)
+                self.host_list.addItem(header)
+
+            for host in grouped[group]:
+                item = QListWidgetItem(f"{host.display_name}\n{host.target}")
+                item.setData(STATE_ROLE, host.id)
+                tooltip = f"{host.username}@{host.hostname}:{host.port}"
+
+                if host.tags:
+                    tooltip += f"\n标签：{', '.join(str(tag) for tag in host.tags)}"
+
+                if host.jump_host_id:
+                    jump = self.context.hosts.get(host.jump_host_id)
+                    tooltip += f"\n跳板机：{jump.display_name if jump else host.jump_host_id}"
+
+                item.setToolTip(tooltip)
+                self.host_list.addItem(item)
+
+                if host.id == selected_id:
+                    self.host_list.setCurrentItem(item)
+
+        if self.host_list.currentItem() is None:
+            self._select_first_host()
 
         self._update_window_title()
+
+    def _select_first_host(self) -> None:
+        """跳过分组标题，选中第一个真实主机。"""
+
+        for row in range(self.host_list.count()):
+            item = self.host_list.item(row)
+
+            if item.data(STATE_ROLE):
+                self.host_list.setCurrentItem(item)
+                return
 
     def _selected_host(self) -> Host | None:
         item = self.host_list.currentItem()
@@ -257,7 +307,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{host.display_name} · {host.target} · 认证: {host.auth_type}")
 
     def new_host(self) -> None:
-        dialog = HostDialog(parent=self)
+        dialog = HostDialog(hosts_for_jump=self.context.hosts.sorted_hosts(), parent=self)
 
         if dialog.exec() != HostDialog.DialogCode.Accepted:
             return
@@ -281,7 +331,12 @@ class MainWindow(QMainWindow):
 
         original_id = host.id
         known = self.context.credentials.get(host.id)
-        dialog = HostDialog(host=host, known_password=known, parent=self)
+        dialog = HostDialog(
+            host=host,
+            known_password=known,
+            hosts_for_jump=self.context.hosts.sorted_hosts(),
+            parent=self,
+        )
 
         if dialog.exec() != HostDialog.DialogCode.Accepted:
             return
@@ -466,6 +521,35 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{host.display_name} 端口转发已关闭")
 
     # ------------------------------------------------------------------
+    # 密钥管理
+    # ------------------------------------------------------------------
+
+    def _active_clients(self) -> dict[str, SSHClient]:
+        """可复用的活跃连接：跳板机 + 已打开的终端会话。"""
+
+        clients = {host_id: client for host_id, client in self.context.jump_clients.items() if client.is_connected()}
+
+        for host_id, tab in self.tabs.items():
+            pane = tab.active_pane() if isinstance(tab, SplitTerminalTab) else tab
+            session = getattr(pane, "session", None)
+            client = getattr(session, "client", None)
+
+            if client is not None and client.is_connected():
+                clients[host_id] = client
+
+        return clients
+
+    def manage_keys(self) -> None:
+        dialog = KeyManagerDialog(
+            self.context.key_store(),
+            self.context.hosts,
+            self.context.credentials,
+            clients=self._active_clients(),
+            parent=self,
+        )
+        dialog.exec()
+
+    # ------------------------------------------------------------------
     # 本地终端 / 分屏
     # ------------------------------------------------------------------
 
@@ -573,6 +657,7 @@ class MainWindow(QMainWindow):
 
         existing = {(host.hostname, host.port, host.username) for host in self.context.hosts.hosts}
         added = 0
+        imported: list[Host] = []
 
         for host in result.hosts:
             if (host.hostname, host.port, host.username) in existing:
@@ -580,6 +665,7 @@ class MainWindow(QMainWindow):
 
             self.context.hosts.add(host)
             existing.add((host.hostname, host.port, host.username))
+            imported.append(host)
             added += 1
 
             secret = secrets.get(host.id)
@@ -587,9 +673,18 @@ class MainWindow(QMainWindow):
             if secret:
                 self.context.credentials.set(host.id, secret)
 
+        # ProxyJump：把别名解析成真实主机 id（跳板机可能就在同一份配置里）
+        jumps = resolve_proxy_jumps(result, imported) if imported else 0
+
+        if jumps:
+            self.context.hosts.save()
+
         self.refresh_hosts()
 
         message = f"导入完成：新增 {added} 台主机（跳过重复 {result.count - added} 台）。"
+
+        if jumps:
+            message += f"\n已解析 {jumps} 条 ProxyJump 跳板机关系。"
 
         if result.skipped:
             message += f"\n忽略 {len(result.skipped)} 个通配/空条目。"

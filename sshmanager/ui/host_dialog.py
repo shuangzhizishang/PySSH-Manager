@@ -32,7 +32,13 @@ class HostDialog(QDialog):
     ``password_changed`` 为 False 表示用户没改密码，调用方应保留原凭据。
     """
 
-    def __init__(self, host: Host | None = None, known_password: str | None = None, parent=None) -> None:
+    def __init__(
+        self,
+        host: Host | None = None,
+        known_password: str | None = None,
+        hosts_for_jump: list[Host] | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
 
         self.setWindowTitle("编辑主机" if host else "新建主机")
@@ -40,6 +46,7 @@ class HostDialog(QDialog):
 
         self._host = host or Host()
         self._has_known_password = known_password is not None
+        self._jump_candidates = hosts_for_jump or []
 
         form = QFormLayout()
 
@@ -96,6 +103,15 @@ class HostDialog(QDialog):
         self.verify_check.setChecked(bool(self._host.verify_host_key))
         form.addRow("", self.verify_check)
 
+        self.tags_edit = QLineEdit(", ".join(str(tag) for tag in (self._host.tags or [])))
+        self.tags_edit.setPlaceholderText("多个标签用逗号分隔，第一个作为侧边栏分组")
+        form.addRow("标签/分组", self.tags_edit)
+
+        self.jump_combo = QComboBox()
+        self.jump_combo.addItem("（直连）", "")
+        self._build_jump_options()
+        form.addRow("跳板机", self.jump_combo)
+
         trust_row = QHBoxLayout()
         trust_row.setContentsMargins(0, 0, 0, 0)
         trust_button = QPushButton("信任并记住此服务器指纹")
@@ -131,6 +147,21 @@ class HostDialog(QDialog):
         self._sync_auth_fields()
 
     # ------------------------------------------------------------------
+
+    def _build_jump_options(self) -> None:
+        """列出可以当跳板机的其他主机。"""
+
+        for candidate in self._jump_candidates:
+            if candidate.id == self._host.id:
+                continue
+
+            self.jump_combo.addItem(
+                f"{candidate.display_name}（{candidate.username}@{candidate.hostname}）",
+                candidate.id,
+            )
+
+        index = self.jump_combo.findData(self._host.jump_host_id)
+        self.jump_combo.setCurrentIndex(max(0, index))
 
     def _sync_auth_fields(self) -> None:
         is_password = self.auth_combo.currentData() == "password"
@@ -186,6 +217,10 @@ class HostDialog(QDialog):
         host.key_path = self.key_edit.text().strip()
         host.verify_host_key = self.verify_check.isChecked()
         host.term_type = self.term_edit.text().strip() or "xterm-256color"
+        host.jump_host_id = self.jump_combo.currentData() or ""
+        host.tags = [
+            tag.strip() for tag in self.tags_edit.text().replace("，", ",").split(",") if tag.strip()
+        ]
 
         if not host.id:
             host.id = uuid.uuid4().hex[:12]

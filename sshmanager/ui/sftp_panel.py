@@ -30,6 +30,95 @@ from ..sftpcore import RemoteEntry, format_size, normalize_remote_path, parent_r
 from ..sftpworker import SftpWorker
 from ..sshclient import SSHClient
 
+REMOTE_MIME = "application/x-pyssh-remote"
+
+STATE_ROLE = Qt.ItemDataRole.UserRole
+
+
+def _remote_entries_from_mime(mime) -> list:
+    """从拖放数据里取回远端条目（仅本进程内的拖拽会有这个格式）。"""
+
+    if not mime.hasFormat(REMOTE_MIME):
+        return []
+
+    raw = bytes(mime.data(REMOTE_MIME)).decode("utf-8", errors="replace")
+    entries = []
+
+    for line in raw.splitlines():
+        parts = line.split("\t")
+
+        if len(parts) != 3:
+            continue
+
+        path, name, flag = parts
+        entries.append(RemoteEntry(name=name, path=path, is_dir=flag == "d"))
+
+    return entries
+
+
+class RemoteTable(QTableWidget):
+    """远端文件表格：可拖出（下载到本地）。"""
+
+    def __init__(self, panel, parent=None) -> None:
+        super().__init__(parent)
+
+        self.panel = panel
+
+    def startDrag(self, supported_actions) -> None:  # noqa: N802 - Qt 命名
+        entries = self.panel.selected_remote_entries()
+
+        if not entries:
+            return
+
+        from PySide6.QtCore import QMimeData
+        from PySide6.QtGui import QDrag
+
+        payload = "\n".join(
+            f"{entry.path}\t{entry.name}\t{'d' if entry.is_dir else 'f'}" for entry in entries
+        )
+
+        mime = QMimeData()
+        mime.setData(REMOTE_MIME, payload.encode("utf-8"))
+
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.DropAction.CopyAction)
+
+
+class LocalTree(QTreeView):
+    """本地文件树：接收拖动（上传）；把远端条目拖进来则下载。"""
+
+    def __init__(self, panel, parent=None) -> None:
+        super().__init__(parent)
+
+        self.panel = panel
+
+    def dragEnterEvent(self, event):  # noqa: N802
+        if event.mimeData().hasUrls() or event.mimeData().hasFormat(REMOTE_MIME):
+            event.acceptProposedAction()
+            return
+
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):  # noqa: N802
+        if event.mimeData().hasUrls() or event.mimeData().hasFormat(REMOTE_MIME):
+            event.acceptProposedAction()
+            return
+
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event):  # noqa: N802
+        remote_entries = _remote_entries_from_mime(event.mimeData())
+        local_paths = [Path(url.toLocalFile()) for url in event.mimeData().urls() if url.isLocalFile()]
+        target = self.panel.local_directory_for_drop(self.indexAt(event.position().toPoint()))
+
+        if remote_entries or local_paths:
+            self.panel.handle_drop(remote_entries, local_paths, target)
+            event.acceptProposedAction()
+            return
+
+        super().dropEvent(event)
+
 
 class SftpPanel(QWidget):
     """一个主机对应一个 SFTP 标签页。"""
@@ -118,12 +207,15 @@ class SftpPanel(QWidget):
             QDir.Filter.AllEntries | QDir.Filter.NoDotAndDotDot | QDir.Filter.Hidden
         )
 
-        self.local_view = QTreeView()
+        self.local_view = LocalTree(self)
         self.local_view.setModel(self.local_model)
         self.local_view.setRootIndex(self.local_model.index(QDir.homePath()))
         self.local_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.local_view.setAlternatingRowColors(True)
         self.local_view.setSortingEnabled(True)
+        self.local_view.setAcceptDrops(True)
+        self.local_view.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.local_view.setDropIndicatorShown(True)
 
         for index in range(1, 4):
             self.local_view.setColumnHidden(index, True)
@@ -169,13 +261,17 @@ class SftpPanel(QWidget):
         path_row.addWidget(refresh_button)
         column.addLayout(path_row)
 
-        self.remote_table = QTableWidget(0, 3)
+        self.remote_table = RemoteTable(self)
+        self.remote_table.setColumnCount(3)
         self.remote_table.setHorizontalHeaderLabels(["名称", "大小", "修改时间"])
         self.remote_table.verticalHeader().setVisible(False)
         self.remote_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.remote_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.remote_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.remote_table.setAlternatingRowColors(True)
+        self.remote_table.setDragEnabled(True)
+        self.remote_table.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        self.remote_table.setAcceptDrops(True)
         self.remote_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.remote_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.remote_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
@@ -359,40 +455,78 @@ class SftpPanel(QWidget):
     # ==================================================================
 
     def upload_selected(self) -> None:
-        paths = self._selected_local_paths()
+        self.upload_paths(self._selected_local_paths(), self._remote_path)
 
-        if not paths:
-            return
+    def upload_paths(self, paths: list[Path], remote_dir: str) -> int:
+        """把本地文件/目录上传到指定远端目录，返回任务数。"""
 
-        for path in paths:
-            if path.is_dir():
-                QMessageBox.information(self, "SFTP", "暂不支持上传整个目录，请选择文件。")
-                continue
-
-            remote_target = normalize_remote_path(f"{self._remote_path}/{path.name}")
-            self.worker.request_upload(path, remote_target)
-
-        self._start_progress(f"上传中（{len(paths)} 个文件）")
-
-    def download_selected(self) -> None:
-        entries = self._selected_remote()
-
-        if not entries:
-            return
-
-        local_dir = Path(self.local_model.filePath(self.local_view.rootIndex()))
+        remote_dir = normalize_remote_path(remote_dir)
         count = 0
 
-        for entry in entries:
-            if entry.is_dir:
-                QMessageBox.information(self, "SFTP", "暂不支持下载整个目录，请选择文件。")
+        for path in paths:
+            if not path.exists():
                 continue
 
-            self.worker.request_download(entry.path, local_dir / entry.name)
+            target = normalize_remote_path(f"{remote_dir}/{path.name}")
+            self.worker.request_upload(path, target, is_dir=path.is_dir())
             count += 1
 
         if count:
-            self._start_progress(f"下载中（{count} 个文件）")
+            self._start_progress(f"上传中（{count} 项）")
+
+        return count
+
+    def download_selected(self) -> None:
+        local_dir = Path(self.local_model.filePath(self.local_view.rootIndex()))
+        self.download_entries(self._selected_remote(), local_dir)
+
+    def download_entries(self, entries, local_dir: Path) -> int:
+        """把远端条目下载到本地目录，返回任务数。"""
+
+        local_dir = Path(local_dir)
+        count = 0
+
+        for entry in entries:
+            self.worker.request_download(entry.path, local_dir / entry.name, is_dir=entry.is_dir)
+            count += 1
+
+        if count:
+            self._start_progress(f"下载中（{count} 项）")
+
+        return count
+
+    # ------------------------------------------------------------------
+    # 拖放
+    # ------------------------------------------------------------------
+
+    def selected_remote_entries(self) -> list[RemoteEntry]:
+        """供拖拽使用：当前选中的远端条目。"""
+
+        return self._selected_remote()
+
+    def local_directory_for_drop(self, index) -> Path:
+        """拖动落点对应的本地目录（落在目录上就进该目录）。"""
+
+        if index is not None and index.isValid():
+            path = Path(self.local_model.filePath(index))
+
+            if path.is_dir():
+                return path
+
+            return path.parent
+
+        return Path(self.local_model.filePath(self.local_view.rootIndex()))
+
+    def handle_drop(self, remote_entries, local_paths, local_dir: Path) -> None:
+        """处理拖放：远端条目 → 下载；本地文件 → 上传。"""
+
+        if remote_entries:
+            count = self.download_entries(remote_entries, local_dir)
+            self._set_status(f"● 已连接 · 拖入下载 {count} 项", "#3fb950")
+
+        if local_paths:
+            count = self.upload_paths(local_paths, self._remote_path)
+            self._set_status(f"● 已连接 · 拖入上传 {count} 项", "#3fb950")
 
     def make_directory(self) -> None:
         name, ok = QInputDialog.getText(self, "新建目录", "目录名：")
@@ -467,19 +601,17 @@ class SftpPanel(QWidget):
             self._set_status(f"● 已连接 · {task}失败", "#f85149")
             QMessageBox.warning(self, task, message)
 
-        if task in ("新建目录", "删除", "重命名", "上传"):
+        if task in ("新建目录", "删除", "删除目录", "重命名", "上传", "上传目录"):
             self.refresh_remote()
 
         self._sync_buttons()
 
     def _sync_buttons(self, *_args) -> None:
-        local_paths = [path for path in self._selected_local_paths() if path.is_file()]
+        local_paths = self._selected_local_paths()
         remote_entries = self._selected_remote()
 
         self.upload_button.setEnabled(bool(local_paths) and self.worker.isRunning())
-        self.download_button.setEnabled(
-            bool([entry for entry in remote_entries if not entry.is_dir]) and self.worker.isRunning()
-        )
+        self.download_button.setEnabled(bool(remote_entries) and self.worker.isRunning())
         self.delete_button.setEnabled(bool(remote_entries) and self.worker.isRunning())
 
     # ==================================================================

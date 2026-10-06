@@ -45,6 +45,15 @@ def legacy_known_hosts_file() -> Path:
     return data_dir() / "known_hosts"
 
 
+def keys_dir() -> Path:
+    """受管理的 SSH 密钥目录。"""
+
+    path = data_dir() / "keys"
+    path.mkdir(parents=True, exist_ok=True)
+
+    return path
+
+
 DEFAULT_COLUMNS = 120
 DEFAULT_ROWS = 32
 

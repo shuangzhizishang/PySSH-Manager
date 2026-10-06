@@ -38,6 +38,21 @@ class Host:
     #: 本地端口转发规则（存 dict，避免循环导入；用 forwarding.ForwardRule 解析）
     forwards: list = field(default_factory=list)
 
+    #: 标签 / 分组（列表里第一个也作为侧边栏的分组名）
+    tags: list = field(default_factory=list)
+
+    @property
+    def group(self) -> str:
+        """侧边栏分组名。"""
+
+        for tag in self.tags or []:
+            text = str(tag).strip()
+
+            if text:
+                return text
+
+        return "未分组"
+
     #: 外观：终端字体与配色
     font_family: str = settings.DEFAULT_FONT_FAMILY
     font_size: int = settings.DEFAULT_FONT_SIZE

@@ -203,6 +203,131 @@ class SftpClient:
 
     # ------------------------------------------------------------------
 
+    def exists(self, path: str, is_dir: bool | None = None) -> bool:
+        """判断远端路径是否存在（可指定期望类型）。"""
+
+        target = normalize_remote_path(path)
+
+        try:
+            attributes = self._client().stat(target)
+        except Exception:
+            return False
+
+        if is_dir is None:
+            return True
+
+        mode = attributes.st_mode or 0
+
+        return stat_module.S_ISDIR(mode) if is_dir else not stat_module.S_ISDIR(mode)
+
+    def mkdir_p(self, path: str) -> None:
+        """逐级创建远端目录（类似 ``mkdir -p``）。"""
+
+        target = normalize_remote_path(path)
+        parts = [part for part in target.split("/") if part]
+        current = ""
+
+        for part in parts:
+            current = f"{current}/{part}"
+
+            if not self.exists(current, is_dir=True):
+                try:
+                    self._client().mkdir(current)
+                except Exception:
+                    # 并发或已存在时忽略
+                    pass
+
+    # ------------------------------------------------------------------
+    # 目录递归传输
+    # ------------------------------------------------------------------
+
+    def upload_tree(
+        self,
+        local_dir: Path,
+        remote_dir: str,
+        progress=None,
+        cancelled=None,
+    ) -> tuple[int, int]:
+        """递归上传目录，返回 ``(文件数, 字节数)``。"""
+
+        local_dir = Path(local_dir)
+        remote_dir = normalize_remote_path(remote_dir)
+        files = 0
+        total_bytes = 0
+        self.mkdir_p(remote_dir)
+
+        for path in sorted(local_dir.rglob("*")):
+            if cancelled is not None and cancelled():
+                raise SFTPError("已取消")
+
+            relative = path.relative_to(local_dir)
+            target = normalize_remote_path(f"{remote_dir}/{relative.as_posix()}")
+
+            if path.is_dir():
+                self.mkdir_p(target)
+                continue
+
+            written = self.upload(path, target, progress=progress, cancelled=cancelled)
+            files += 1
+            total_bytes += written
+
+        return files, total_bytes
+
+    def download_tree(
+        self,
+        remote_dir: str,
+        local_dir: Path,
+        progress=None,
+        cancelled=None,
+    ) -> tuple[int, int]:
+        """递归下载目录，返回 ``(文件数, 字节数)``。"""
+
+        remote_dir = normalize_remote_path(remote_dir)
+        local_dir = Path(local_dir)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        files = 0
+        total_bytes = 0
+
+        for entry in self.listdir(remote_dir):
+            if cancelled is not None and cancelled():
+                raise SFTPError("已取消")
+
+            if entry.is_dir:
+                sub_files, sub_bytes = self.download_tree(
+                    entry.path,
+                    local_dir / entry.name,
+                    progress=progress,
+                    cancelled=cancelled,
+                )
+                files += sub_files
+                total_bytes += sub_bytes
+                continue
+
+            written = self.download(entry.path, local_dir / entry.name, progress=progress, cancelled=cancelled)
+            files += 1
+            total_bytes += written
+
+        return files, total_bytes
+
+    def remove_tree(self, remote_dir: str) -> int:
+        """递归删除远端目录，返回删除的条目数。"""
+
+        remote_dir = normalize_remote_path(remote_dir)
+        removed = 0
+
+        for entry in self.listdir(remote_dir):
+            if entry.is_dir:
+                removed += self.remove_tree(entry.path)
+            else:
+                self.remove(entry.path)
+                removed += 1
+
+        self.remove(remote_dir, is_dir=True)
+
+        return removed + 1
+
+    # ------------------------------------------------------------------
+
     def download(
         self,
         remote_path: str,

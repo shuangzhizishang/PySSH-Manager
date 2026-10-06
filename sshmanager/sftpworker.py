@@ -58,16 +58,16 @@ class SftpWorker(QThread):
     def request_list(self, path: str) -> None:
         self._jobs.put(("list", path))
 
-    def request_download(self, remote_path: str, local_path: Path) -> None:
-        self._jobs.put(("download", remote_path, Path(local_path)))
+    def request_download(self, remote_path: str, local_path: Path, is_dir: bool = False) -> None:
+        self._jobs.put(("download", remote_path, Path(local_path), is_dir))
 
-    def request_upload(self, local_path: Path, remote_path: str) -> None:
-        self._jobs.put(("upload", Path(local_path), remote_path))
+    def request_upload(self, local_path: Path, remote_path: str, is_dir: bool = False) -> None:
+        self._jobs.put(("upload", Path(local_path), remote_path, is_dir))
 
     def request_mkdir(self, path: str) -> None:
         self._jobs.put(("mkdir", path))
 
-    def request_remove(self, path: str, is_dir: bool) -> None:
+    def request_remove(self, path: str, is_dir: bool = False) -> None:
         self._jobs.put(("remove", path, is_dir))
 
     def request_rename(self, old_path: str, new_path: str) -> None:
@@ -147,33 +147,54 @@ class SftpWorker(QThread):
                 return
 
             if action == "download":
-                remote_path, local_path = job[1], job[2]
+                remote_path, local_path, is_dir = job[1], job[2], job[3]
+                name = Path(remote_path).name or remote_path
 
-                def on_progress(done: int, total: int) -> None:
-                    self.progress.emit(f"下载 {Path(remote_path).name}", done, total)
+                def on_progress(done: int, total: int, label: str = name) -> None:
+                    self.progress.emit(f"下载 {label}", done, total)
 
-                size = self._sftp.download(
-                    remote_path,
-                    local_path,
-                    progress=on_progress,
-                    cancelled=self._cancel.is_set,
-                )
-                self.task_finished.emit("下载", True, f"{Path(local_path).name}（{size} 字节）")
+                if is_dir:
+                    files, size = self._sftp.download_tree(
+                        remote_path,
+                        local_path,
+                        progress=on_progress,
+                        cancelled=self._cancel.is_set,
+                    )
+                    self.task_finished.emit("下载目录", True, f"{name}（{files} 个文件，{size} 字节）")
+                else:
+                    size = self._sftp.download(
+                        remote_path,
+                        local_path,
+                        progress=on_progress,
+                        cancelled=self._cancel.is_set,
+                    )
+                    self.task_finished.emit("下载", True, f"{local_path.name}（{size} 字节）")
+
                 return
 
             if action == "upload":
-                local_path, remote_path = job[1], job[2]
+                local_path, remote_path, is_dir = job[1], job[2], job[3]
 
-                def on_upload_progress(done: int, total: int) -> None:
-                    self.progress.emit(f"上传 {local_path.name}", done, total)
+                def on_upload_progress(done: int, total: int, label: str = local_path.name) -> None:
+                    self.progress.emit(f"上传 {label}", done, total)
 
-                size = self._sftp.upload(
-                    local_path,
-                    remote_path,
-                    progress=on_upload_progress,
-                    cancelled=self._cancel.is_set,
-                )
-                self.task_finished.emit("上传", True, f"{remote_path}（{size} 字节）")
+                if is_dir:
+                    files, size = self._sftp.upload_tree(
+                        local_path,
+                        remote_path,
+                        progress=on_upload_progress,
+                        cancelled=self._cancel.is_set,
+                    )
+                    self.task_finished.emit("上传目录", True, f"{local_path.name}（{files} 个文件，{size} 字节）")
+                else:
+                    size = self._sftp.upload(
+                        local_path,
+                        remote_path,
+                        progress=on_upload_progress,
+                        cancelled=self._cancel.is_set,
+                    )
+                    self.task_finished.emit("上传", True, f"{remote_path}（{size} 字节）")
+
                 return
 
             if action == "mkdir":
@@ -182,8 +203,15 @@ class SftpWorker(QThread):
                 return
 
             if action == "remove":
-                self._sftp.remove(job[1], is_dir=bool(job[2]))
-                self.task_finished.emit("删除", True, job[1])
+                path, is_dir = job[1], bool(job[2])
+
+                if is_dir:
+                    removed = self._sftp.remove_tree(path)
+                    self.task_finished.emit("删除目录", True, f"{path}（{removed} 项）")
+                else:
+                    self._sftp.remove(path, is_dir=False)
+                    self.task_finished.emit("删除", True, path)
+
                 return
 
             if action == "rename":

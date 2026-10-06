@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .credentials import CredentialStore
@@ -36,7 +36,6 @@ _IGNORED_PREFIXES = (
     "localforward",
     "remoteforward",
     "dynamicforward",
-    "proxyjump",
     "proxycommand",
     "addkeystoagent",
     "identitiesonly",
@@ -49,6 +48,8 @@ class ImportResult:
     hosts: list[Host]
     skipped: list[str]
     warnings: list[str]
+    #: 别名 → ProxyJump 目标别名（由调用方解析成真实主机 id）
+    proxy_jumps: dict[str, str] = field(default_factory=dict)
 
     @property
     def count(self) -> int:
@@ -84,6 +85,7 @@ def parse_openssh_config(text: str) -> ImportResult:
     warnings: list[str] = []
 
     current: dict | None = None
+    proxy_jumps: dict[str, str] = {}
 
     def flush() -> None:
         nonlocal current
@@ -113,6 +115,15 @@ def parse_openssh_config(text: str) -> ImportResult:
             key_path=key_path,
             verify_host_key=current.get("stricthostkeychecking", "yes").lower() not in ("no", "false", "off"),
         )
+
+        # 用别名当分组：``prod-web`` 归到 ``prod``
+        if alias:
+            host.tags = [alias.split("-")[0]] if "-" in alias else [alias]
+
+        jump = current.get("proxyjump")
+
+        if jump:
+            proxy_jumps[alias] = jump.split(",")[0].strip()
 
         hosts.append(host)
         current = None
@@ -169,10 +180,43 @@ def parse_openssh_config(text: str) -> ImportResult:
             current["user"] = value
         elif key == "identityfile":
             current["identityfile"] = value.replace("%d", str(Path.home()))
+        elif key == "proxyjump":
+            # 支持 user@host:port 形式，只取主机部分用于匹配别名
+            target = value.split(",")[0].strip()
+            target = target.rsplit("@", 1)[-1]
+            current["proxyjump"] = target.split(":")[0]
 
     flush()
 
-    return ImportResult(hosts=hosts, skipped=skipped, warnings=warnings)
+    return ImportResult(hosts=hosts, skipped=skipped, warnings=warnings, proxy_jumps=proxy_jumps)
+
+
+def resolve_proxy_jumps(result: "ImportResult", store_hosts: list[Host]) -> int:
+    """把导入结果里的 ProxyJump 别名解析成主机 id，返回成功解析的数量。
+
+    ``store_hosts`` 是已经保存进 HostStore 的主机（调用方按导入顺序追加）。
+    """
+
+    if not result.proxy_jumps:
+        return 0
+
+    by_label = {host.label: host for host in store_hosts if host.label}
+    by_hostname = {host.hostname: host for host in store_hosts if host.hostname}
+    resolved = 0
+
+    for host in store_hosts:
+        target = result.proxy_jumps.get(host.label)
+
+        if not target or host.jump_host_id:
+            continue
+
+        jump_host = by_label.get(target) or by_hostname.get(target)
+
+        if jump_host is not None and jump_host.id != host.id:
+            host.jump_host_id = jump_host.id
+            resolved += 1
+
+    return resolved
 
 
 def export_openssh_config(hosts: list[Host], include_credentials: bool = False) -> str:
@@ -194,6 +238,9 @@ def export_openssh_config(hosts: list[Host], include_credentials: bool = False) 
 
         if host.key_path:
             lines.append(f"    IdentityFile {host.key_path}")
+
+        if host.tags:
+            lines.append(f"    # Tags: {', '.join(str(tag) for tag in host.tags)}")
 
         if not host.verify_host_key:
             lines.append("    StrictHostKeyChecking no")
