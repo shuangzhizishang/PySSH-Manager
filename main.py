@@ -41,6 +41,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="启动后不自动连接，只显示主机列表",
     )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="启动时额外打开一个本地终端标签",
+    )
 
     return parser.parse_args(argv)
 
@@ -103,6 +108,9 @@ def main(argv: list[str] | None = None) -> int:
         window._select_host(host.id)
 
     window.show()
+
+    if args.local:
+        window.open_local_terminal()
 
     if target_id:
         host = context.hosts.get(target_id)

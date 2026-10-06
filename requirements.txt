@@ -8,5 +8,8 @@ pyte>=0.8.1
 # 非 Windows 平台的凭据回退加密（Windows 走系统 DPAPI）
 cryptography>=42.0
 
+# 本地终端（Windows 走 ConPTY；仅 Windows 需要）
+pywinpty>=2.0; sys_platform == "win32"
+
 # 测试
 pytest>=8.0

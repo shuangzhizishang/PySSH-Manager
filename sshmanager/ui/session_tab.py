@@ -1,146 +1,257 @@
-"""一个会话标签页：终端视图 + 状态栏 + SSH 线程。"""
+"""会话标签页：SSH 会话或本地终端，每个标签对应一个终端画面。
+
+- :class:`TerminalTab`：纯终端画面（分屏容器复用它，不含状态栏）
+- :class:`SessionTab`：带状态栏的完整标签页
+- :class:`LocalTerminalTab`：本地终端（ConPTY）
+"""
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtWidgets import QLabel, QHBoxLayout, QVBoxLayout, QWidget
+import uuid
+
+from PySide6.QtCore import QTimer, Signal
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from ..hosts import Host
+from ..localsession import LocalShellSession
 from ..session import SSHSession
 from ..sshclient import SSHClient
 from ..terminal.view import TerminalView
 
+LOCAL_ID = "local"
 
-class SessionTab(QWidget):
-    """把终端控件和一条 SSH 连接绑在一起。"""
 
-    #: 标题变化（由远端 OSC 序列设置）
+def make_local_host(shell_command: str | None = None) -> Host:
+    """造一个代表本地终端的主机对象（仅用于界面归类，不持久化）。"""
+
+    return Host(
+        label="本地终端",
+        hostname=shell_command or "local",
+        port=0,
+        username="",
+        auth_type="local",
+        verify_host_key=False,
+    )
+
+
+class TerminalTab(QWidget):
+    """一个终端画面 + 一条会话（SSH 或本地）。
+
+    默认不自动启动，由子类在界面搭好后调用 :meth:`start`。
+    """
+
     title_changed = Signal(str)
-
-    #: 线程结束
     closed = Signal()
-
-    #: 需要向用户展示的错误（附指纹确认机会）
-    error_raised = Signal(str)
+    failed = Signal(str)
 
     def __init__(
         self,
-        host: Host,
+        host: Host | None = None,
         credential: str | None = None,
         jump: SSHClient | None = None,
+        shell_command: str | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
 
         self.host = host
         self.credential = credential
+        self.jump = jump
+        self.shell_command = shell_command
 
         self._closing = False
+        self.status_hint = "○ 正在连接..."
 
         self.view = TerminalView()
-
-        self.status = QLabel("○ 正在连接...")
-        self.status.setStyleSheet("color: #d29922; padding: 2px 8px;")
-
-        self.target = QLabel(host.target)
-        self.target.setStyleSheet("color: #8b949e; padding: 2px 8px;")
-
-        bar = QWidget()
-        bar_layout = QHBoxLayout(bar)
-        bar_layout.setContentsMargins(0, 0, 0, 0)
-        bar_layout.addWidget(self.status)
-        bar_layout.addStretch()
-        bar_layout.addWidget(self.target)
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        layout.addWidget(bar)
-        layout.addWidget(self.view, 1)
-
-        self.view.apply_font(host.font_family, host.font_size)
-        self.view.title_changed.connect(self._on_title)
-        self.view.terminal_resized.connect(self._on_resized)
         self.view.data_to_send.connect(self._on_input)
+        self.view.terminal_resized.connect(self._on_resized)
+        self.view.title_changed.connect(self._on_title)
 
-        self.session = SSHSession(host, credential=credential, jump=jump)
-        self.session.data_received.connect(self.view.feed)
-        self.session.connected.connect(self._on_connected)
-        self.session.failed.connect(self._on_failed)
-        self.session.disconnected.connect(self._on_disconnected)
-        self.session.finished.connect(self._on_finished)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(0)
+        self._layout.addWidget(self.view)
 
-        self.session.start()
+        if host is not None:
+            self.view.apply_font(host.font_family, host.font_size)
 
-        QTimer.singleShot(0, self.view.setFocus)
+        self.session = None
 
     # ------------------------------------------------------------------
 
     @property
+    def is_local(self) -> bool:
+        return self.shell_command is not None or (self.host is not None and self.host.auth_type == "local")
+
+    @property
     def display_name(self) -> str:
-        return self.host.display_name
+        if self.host is not None:
+            return self.host.display_name
 
-    def reconnect(self, credential: str | None = None, jump: SSHClient | None = None) -> None:
-        if credential is not None:
-            self.credential = credential
+        return "本地终端"
 
-        self.session.request_stop()
-        self.session.wait(2000)
+    def start(self) -> None:
+        self.session = self._create_session()
 
-        self.session = SSHSession(self.host, credential=self.credential, jump=jump)
         self.session.data_received.connect(self.view.feed)
         self.session.connected.connect(self._on_connected)
         self.session.failed.connect(self._on_failed)
         self.session.disconnected.connect(self._on_disconnected)
         self.session.finished.connect(self._on_finished)
-
-        self._set_status("○ 正在连接...", "#d29922")
         self.session.start()
 
-    def close(self) -> None:
-        self._closing = True
+        QTimer.singleShot(0, self.view.setFocus)
 
-        self.session.request_stop()
-        self.session.client.close()
+    def _create_session(self):
+        if self.is_local:
+            return LocalShellSession(command=self.shell_command)
 
-        if not self.session.wait(2000):
+        return SSHSession(self.host, credential=self.credential, jump=self.jump)
+
+    def _stop_session(self) -> None:
+        if self.session is None:
+            return
+
+        if hasattr(self.session, "mark_closing"):
+            self.session.mark_closing()
+
+        # 先打断阻塞中的连接/读取，避免线程在进程退出阶段还挂在 recv 上
+        if hasattr(self.session, "cancel"):
+            self.session.cancel()
+        else:
+            self.session.request_stop()
+
+        if not self.session.wait(3000):
             self.session.terminate()
             self.session.wait(500)
 
     # ------------------------------------------------------------------
 
+    def reconnect(self, credential: str | None = None, jump: SSHClient | None = None) -> None:
+        if self.is_local:
+            return
+
+        if credential is not None:
+            self.credential = credential
+
+        if jump is not None:
+            self.jump = jump
+
+        self._stop_session()
+        self._on_status_changed("○ 正在连接...", "#d29922")
+        self.start()
+
+    def close(self) -> None:
+        self._closing = True
+        self._stop_session()
+
+    # ------------------------------------------------------------------
+
     def _on_input(self, data: bytes) -> None:
-        self.session.send(data)
+        if self.session is not None:
+            self.session.send(data)
 
     def _on_resized(self, columns: int, rows: int) -> None:
-        self.session.set_terminal_size(columns, rows)
+        if self.session is not None:
+            self.session.set_terminal_size(columns, rows)
 
     def _on_title(self, title: str) -> None:
         if title:
             self.title_changed.emit(title)
 
-    def _on_connected(self, ) -> None:
-        self._set_status("● 已连接", "#3fb950")
+    def _on_connected(self) -> None:
+        self._on_status_changed("● 已连接", "#3fb950")
 
-        columns, rows = self.view.emulator.columns, self.view.emulator.lines
-        self.session.set_terminal_size(columns, rows)
-        self.view.setFocus()
+        if self.session is not None:
+            self.session.set_terminal_size(self.view.emulator.columns, self.view.emulator.lines)
+
+        if self.isVisible():
+            self.view.setFocus()
 
     def _on_failed(self, message: str) -> None:
-        self._set_status("● 连接失败", "#f85149")
+        self._on_status_changed("● 连接失败", "#f85149")
         self.view.feed(f"\r\n\x1b[31m[连接失败] {message}\x1b[0m\r\n".encode("utf-8"))
-        self.error_raised.emit(message)
+        self.failed.emit(message)
 
     def _on_disconnected(self) -> None:
         if self._closing:
             return
 
-        self._set_status("○ 已断开", "#8b949e")
+        self._on_status_changed("○ 已断开", "#8b949e")
         self.view.feed("\r\n\x1b[33m[连接已关闭]\x1b[0m\r\n".encode("utf-8"))
 
     def _on_finished(self) -> None:
         self.closed.emit()
 
-    def _set_status(self, text: str, color: str) -> None:
+    def _on_status_changed(self, text: str, color: str) -> None:
+        """子类覆盖以更新状态栏；基类只记录文本。"""
+
+        self.status_hint = text
+
+
+class SessionTab(TerminalTab):
+    """带状态栏的完整标签页。"""
+
+    error_raised = Signal(str)
+
+    def __init__(
+        self,
+        host: Host | None = None,
+        credential: str | None = None,
+        jump: SSHClient | None = None,
+        shell_command: str | None = None,
+        parent=None,
+    ) -> None:
+        super().__init__(
+            host=host,
+            credential=credential,
+            jump=jump,
+            shell_command=shell_command,
+            parent=parent,
+        )
+
+        self._build_status_bar()
+        self.failed.connect(self.error_raised)
+        self.start()
+
+    def _build_status_bar(self) -> None:
+        self.status = QLabel("○ 正在连接...")
+        self.status.setStyleSheet("color: #d29922; padding: 2px 8px;")
+
+        self.target = QLabel(self._target_text())
+        self.target.setStyleSheet("color: #8b949e; padding: 2px 8px;")
+
+        bar = QWidget()
+        bar.setStyleSheet("background-color: #161b22;")
+
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.status)
+        row.addStretch()
+        row.addWidget(self.target)
+
+        self._layout.insertWidget(0, bar)
+
+    def _target_text(self) -> str:
+        if self.host is None:
+            return "本地"
+
+        return self.host.hostname if self.is_local else self.host.target
+
+    def _on_status_changed(self, text: str, color: str) -> None:
+        self.status_hint = text
         self.status.setText(text)
         self.status.setStyleSheet(f"color: {color}; padding: 2px 8px;")
+
+
+class LocalTerminalTab(SessionTab):
+    """本地终端标签。"""
+
+    def __init__(self, shell_command: str | None = None, parent=None) -> None:
+        super().__init__(
+            host=make_local_host(shell_command),
+            shell_command=shell_command,
+            parent=parent,
+        )
+
+        self.host.id = f"{LOCAL_ID}-{uuid.uuid4().hex[:8]}"

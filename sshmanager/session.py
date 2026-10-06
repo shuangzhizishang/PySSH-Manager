@@ -66,6 +66,12 @@ class SSHSession(QThread):
     def request_stop(self) -> None:
         self._stop_requested = True
 
+    def cancel(self) -> None:
+        """强制打断阻塞中的连接/读取（用于关闭窗口时避免线程悬挂）。"""
+
+        self._stop_requested = True
+        self.client.close()
+
     # ------------------------------------------------------------------
 
     def run(self) -> None:
@@ -84,8 +90,14 @@ class SSHSession(QThread):
                 jump=self.jump,
             )
         except Exception as error:  # noqa: BLE001 - 需要把任何失败反馈到界面
-            self.failed.emit(f"{error}")
-            self._stop_requested = True
+            if not self._stop_requested:
+                self.failed.emit(f"{error}")
+
+            return
+
+        if self._stop_requested:
+            self.client.close()
+            self._report_closed()
             return
 
         self.connected.emit()
@@ -95,11 +107,13 @@ class SSHSession(QThread):
                 data = self.client.recv()
 
                 if not data:
-                    break
+                    # socket.timeout 也走这里：说明这一轮没数据，继续等
+                    continue
 
                 self.data_received.emit(data)
         except Exception as error:  # noqa: BLE001
-            self.failed.emit(f"{error}\n{traceback.format_exc(limit=2)}")
+            if not self._stop_requested:
+                self.failed.emit(f"{error}\n{traceback.format_exc(limit=2)}")
         finally:
             self.client.close()
             self._report_closed()
