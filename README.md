@@ -81,6 +81,7 @@ tests/
   gui_e2e.py                真实 GUI 端到端 + 截图
   sftp_forward_smoke.py     SFTP + 端口转发真实链路验证
   sftp_gui_e2e.py           SFTP 面板与转发对话框 GUI 验证
+  key_auth_smoke.py         密钥认证验证（本地起 paramiko 服务器，不出网）
 ```
 
 ## 测试
@@ -104,6 +105,9 @@ $env:QT_QPA_PLATFORM='offscreen'
 
 # SFTP 面板与端口转发对话框的 GUI 验证
 .venv\Scripts\python.exe tests\sftp_gui_e2e.py --host 192.168.206.130 --password <密码>
+
+# 密钥认证（本地 paramiko 服务器，不需要外网）
+.venv\Scripts\python.exe tests\key_auth_smoke.py
 ```
 
 ## 三个已踩过的坑（改动时注意）
