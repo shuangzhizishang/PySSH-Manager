@@ -232,7 +232,7 @@ class SSHClient:
                 pass
 
     # ------------------------------------------------------------------
-    # SFTP / 端口转发
+    # SFTP
     # ------------------------------------------------------------------
 
     def open_sftp(self) -> paramiko.SFTPClient:
@@ -241,15 +241,6 @@ class SSHClient:
 
         return self.client.open_sftp()
 
-    def forward_local(self, local_port: int, remote_host: str, remote_port: int, bind: str = "127.0.0.1"):
-        """本地端口转发：本地端口 -> SSH 服务器可达的 remote_host:remote_port。"""
-
-        if self.client is None:
-            raise RuntimeError("尚未连接")
-
-        transport = self.client.get_transport()
-
-        if transport is None:
-            raise RuntimeError("SSH 传输层不可用")
-
-        return transport.request_port_forward(bind, local_port)
+    # 端口转发见 sshmanager.forwarding.ForwardManager：
+    # 本地转发（ssh -L）需要自己在本机监听，不能用 Transport.request_port_forward
+    # （那是远端转发 ssh -R）。

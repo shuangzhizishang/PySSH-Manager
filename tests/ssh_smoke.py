@@ -113,7 +113,12 @@ def main() -> int:
             )
             state["sent"] = True
 
-        if MARKER in text and COLOR_MARKER in text and not state["done"]:
+        # 命令回显里也含标记，用「执行结果」判定：两个标记各自单独成行
+        executed = any(line.strip() == MARKER for line in text.splitlines()) and any(
+            line.strip() == COLOR_MARKER for line in text.splitlines()
+        )
+
+        if executed and not state["done"]:
             state["done"] = True
             # 会话退出会清屏，所以在这一刻抓图
             grab_screenshot()

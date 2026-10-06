@@ -35,6 +35,9 @@ class Host:
     #: 跳板机（另一个 Host 的 id），留空表示直连
     jump_host_id: str = ""
 
+    #: 本地端口转发规则（存 dict，避免循环导入；用 forwarding.ForwardRule 解析）
+    forwards: list = field(default_factory=list)
+
     #: 外观：终端字体与配色
     font_family: str = settings.DEFAULT_FONT_FAMILY
     font_size: int = settings.DEFAULT_FONT_SIZE

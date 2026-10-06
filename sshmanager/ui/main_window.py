@@ -22,8 +22,10 @@ from .. import APP_NAME, __version__
 from ..credentials import CredentialStore
 from ..hosts import Host, HostStore
 from ..sshclient import SSHClient
+from .forward_dialog import ForwardDialog
 from .host_dialog import HostDialog
 from .session_tab import SessionTab
+from .sftp_panel import SftpPanel
 
 STATE_ROLE = Qt.ItemDataRole.UserRole
 
@@ -49,6 +51,7 @@ class MainWindow(QMainWindow):
 
         self.context = context
         self.tabs: dict[str, SessionTab] = {}
+        self.sftp_tabs: dict[str, SftpPanel] = {}
         self._quitting = False
 
         self.setWindowTitle(f"{APP_NAME} {__version__}")
@@ -82,6 +85,14 @@ class MainWindow(QMainWindow):
         self.action_reconnect.setShortcut(QKeySequence("Ctrl+R"))
         self.action_reconnect.triggered.connect(self.reconnect_current)
 
+        self.action_sftp = QAction("SFTP 文件", self)
+        self.action_sftp.setShortcut(QKeySequence("Ctrl+Shift+F"))
+        self.action_sftp.triggered.connect(self.open_sftp)
+
+        self.action_forwards = QAction("端口转发", self)
+        self.action_forwards.setShortcut(QKeySequence("Ctrl+Shift+P"))
+        self.action_forwards.triggered.connect(self.open_forwards)
+
         self.action_close_tab = QAction("关闭标签", self)
         self.action_close_tab.setShortcut(QKeySequence("Ctrl+W"))
         self.action_close_tab.triggered.connect(self.close_current_tab)
@@ -104,6 +115,9 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.action_connect)
         toolbar.addAction(self.action_reconnect)
         toolbar.addSeparator()
+        toolbar.addAction(self.action_sftp)
+        toolbar.addAction(self.action_forwards)
+        toolbar.addSeparator()
         toolbar.addAction(self.action_new)
         toolbar.addAction(self.action_edit)
         toolbar.addAction(self.action_delete)
@@ -112,6 +126,9 @@ class MainWindow(QMainWindow):
         menu = self.menuBar().addMenu("会话")
         menu.addAction(self.action_connect)
         menu.addAction(self.action_reconnect)
+        menu.addSeparator()
+        menu.addAction(self.action_sftp)
+        menu.addAction(self.action_forwards)
         menu.addSeparator()
         menu.addAction(self.action_new)
         menu.addAction(self.action_edit)
@@ -283,23 +300,10 @@ class MainWindow(QMainWindow):
             self.tabs_widget.setCurrentWidget(self.tabs[host.id])
             return
 
-        credential = self.context.credentials.get(host.id)
+        credential = self._ensure_credential(host)
 
-        if host.auth_type == "password" and not credential:
-            text, ok = QInputDialog.getText(
-                self,
-                APP_NAME,
-                f"请输入 {host.target} 的密码（将加密保存到本机）：",
-                QInputDialog.EchoMode.Normal,
-            )
-
-            if not ok:
-                return
-
-            credential = text
-
-            if credential:
-                self.context.credentials.set(host.id, credential)
+        if credential is None:
+            return
 
         jump = self._jump_client_for(host)
 
@@ -315,6 +319,84 @@ class MainWindow(QMainWindow):
         self.tabs[host.id] = tab
         self.context.hosts.mark_connected(host.id)
         self._update_window_title()
+
+    def _ensure_credential(self, host: Host) -> str | None:
+        """取主机凭据；密码认证且没有保存过时，向用户询问一次并加密保存。"""
+
+        credential = self.context.credentials.get(host.id)
+
+        if host.auth_type != "password" or credential:
+            return credential
+
+        text, ok = QInputDialog.getText(
+            self,
+            APP_NAME,
+            f"请输入 {host.target} 的密码（将加密保存到本机）：",
+            QInputDialog.EchoMode.Normal,
+        )
+
+        if not ok:
+            return None
+
+        if text:
+            self.context.credentials.set(host.id, text)
+
+        return text or None
+
+    # ------------------------------------------------------------------
+    # SFTP / 端口转发
+    # ------------------------------------------------------------------
+
+    def open_sftp(self) -> None:
+        host = self._selected_host()
+
+        if host is None:
+            QMessageBox.information(self, APP_NAME, "请先在左侧选择一台主机。")
+            return
+
+        panel = self.sftp_tabs.get(host.id)
+
+        if panel is not None:
+            self.tabs_widget.setCurrentWidget(panel)
+            return
+
+        credential = self._ensure_credential(host)
+
+        if credential is None:
+            return
+
+        panel = SftpPanel(host, credential=credential, jump=self._jump_client_for(host))
+        index = self.tabs_widget.addTab(panel, f"SFTP · {host.display_name}")
+        self.tabs_widget.setTabToolTip(index, host.target)
+        self.tabs_widget.setCurrentIndex(index)
+
+        self.sftp_tabs[host.id] = panel
+        self._update_window_title()
+
+    def open_forwards(self) -> None:
+        host = self._selected_host()
+
+        if host is None:
+            QMessageBox.information(self, APP_NAME, "请先在左侧选择一台主机。")
+            return
+
+        credential = self._ensure_credential(host)
+
+        if credential is None:
+            return
+
+        session = self.tabs.get(host.id)
+        existing = session.session.client if session is not None else None
+
+        dialog = ForwardDialog(
+            host,
+            credential=credential,
+            jump=self._jump_client_for(host),
+            existing_client=existing,
+            parent=self,
+        )
+        dialog.exec()
+        self.statusBar().showMessage(f"{host.display_name} 端口转发已关闭")
 
     def _jump_client_for(self, host: Host) -> SSHClient | None:
         """按需建立并缓存跳板机连接。"""
@@ -398,9 +480,11 @@ class MainWindow(QMainWindow):
     def _on_tab_changed(self, index: int) -> None:
         widget = self.tabs_widget.widget(index)
 
-        if isinstance(widget, SessionTab):
+        if isinstance(widget, (SessionTab, SftpPanel)):
             self._select_host(widget.host.id)
-            widget.view.setFocus()
+
+            if isinstance(widget, SessionTab):
+                widget.view.setFocus()
 
         self._update_window_title()
 
@@ -414,28 +498,38 @@ class MainWindow(QMainWindow):
     def close_tab(self, index: int) -> None:
         widget = self.tabs_widget.widget(index)
 
-        if not isinstance(widget, SessionTab):
+        if isinstance(widget, SessionTab):
+            host = widget.host
+            widget.close()
+            self.tabs_widget.removeTab(index)
+
+            if self.tabs.get(host.id) is widget:
+                del self.tabs[host.id]
+        elif isinstance(widget, SftpPanel):
+            host = widget.host
+            widget.close()
+            self.tabs_widget.removeTab(index)
+
+            if self.sftp_tabs.get(host.id) is widget:
+                del self.sftp_tabs[host.id]
+        else:
             return
-
-        host = widget.host
-        widget.close()
-
-        self.tabs_widget.removeTab(index)
-
-        if self.tabs.get(host.id) is widget:
-            del self.tabs[host.id]
 
         self._update_window_title()
 
     def reconnect_current(self) -> None:
         widget = self.tabs_widget.currentWidget()
 
+        if isinstance(widget, SftpPanel):
+            self.statusBar().showMessage("SFTP 标签不支持重连，请关闭后重新打开")
+            return
+
         if not isinstance(widget, SessionTab):
             self.statusBar().showMessage("当前没有活动会话")
             return
 
         jump = self._jump_client_for(widget.host)
-        credential = self.context.credentials.get(widget.host.id)
+        credential = self._ensure_credential(widget.host)
         widget.reconnect(credential=credential, jump=jump)
 
     # ------------------------------------------------------------------
@@ -461,6 +555,8 @@ class MainWindow(QMainWindow):
 
         if isinstance(widget, SessionTab):
             self.setWindowTitle(f"{APP_NAME} {__version__} — {widget.display_name}")
+        elif isinstance(widget, SftpPanel):
+            self.setWindowTitle(f"{APP_NAME} {__version__} — SFTP {widget.host.display_name}")
         else:
             self.setWindowTitle(f"{APP_NAME} {__version__}")
 
@@ -470,7 +566,11 @@ class MainWindow(QMainWindow):
         for tab in list(self.tabs.values()):
             tab.close()
 
+        for panel in list(self.sftp_tabs.values()):
+            panel.close()
+
         self.tabs.clear()
+        self.sftp_tabs.clear()
         self.context.close()
 
         event.accept()
@@ -522,4 +622,26 @@ QPushButton {
     padding: 6px 12px;
 }
 QPushButton:hover { background-color: #30363d; }
+QTreeView, QTableWidget {
+    background-color: #0d1117;
+    color: #e6edf3;
+    border: 1px solid #21262d;
+    alternate-background-color: #11161d;
+    gridline-color: #21262d;
+}
+QTreeView::item:selected, QTableWidget::item:selected { background-color: #1f6feb; color: #ffffff; }
+QHeaderView::section {
+    background-color: #161b22;
+    color: #8b949e;
+    border: none;
+    padding: 4px 6px;
+}
+QProgressBar {
+    background-color: #21262d;
+    border: none;
+    border-radius: 4px;
+    color: #e6edf3;
+    text-align: center;
+}
+QProgressBar::chunk { background-color: #1f6feb; border-radius: 4px; }
 """
