@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QDir, Qt, Signal
+from PySide6.QtCore import QDir, QModelIndex, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -248,7 +248,8 @@ class SftpPanel(QWidget):
         column.addLayout(path_row)
 
         self.local_model = LocalFileModel(self)
-        # 根设为"此电脑"（空路径），C: / D: 等所有盘符都会列出来
+        # 根设为"此电脑"：Qt 里用**模型默认根索引**（QModelIndex()）表示这一层，
+        # 它的子项就是各盘符（C:、D: …）。注意 model.index("") 是取不到的（0 行）。
         self.local_model.setRootPath("")
         self.local_model.setFilter(
             QDir.Filter.AllEntries | QDir.Filter.NoDotAndDotDot | QDir.Filter.Hidden | QDir.Filter.Drives
@@ -256,7 +257,7 @@ class SftpPanel(QWidget):
 
         self.local_view = LocalTree(self)
         self.local_view.setModel(self.local_model)
-        self.local_view.setRootIndex(self.local_model.index(""))
+        self.local_view.setRootIndex(QModelIndex())
         self.local_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.local_view.setAlternatingRowColors(True)
         self.local_view.setSortingEnabled(True)
@@ -275,10 +276,8 @@ class SftpPanel(QWidget):
 
         self._reload_drives()
 
-        # 首次打开定位到用户主目录（但树根仍是"此电脑"，可以点盘符切走）
-        home = QDir.homePath()
-        self.local_view.setRootIndex(self.local_model.index(home))
-        self.local_path_edit.setText(home)
+        # 默认停在"此电脑"层，直接能看到 C: / D:；也可以点盘符下拉直接进入某个盘
+        self.local_path_edit.setPlaceholderText("此电脑（双击盘符进入）")
         self._sync_drive_selection()
 
         return pane
@@ -313,12 +312,14 @@ class SftpPanel(QWidget):
         self._sync_drive_selection()
 
     def _local_root_path(self) -> str:
+        """当前本地根目录；处于"此电脑"层时返回空串。"""
+
         index = self.local_view.rootIndex()
 
         return self.local_model.filePath(index) if index.isValid() else ""
 
     def _sync_drive_selection(self) -> None:
-        """根据当前目录高亮对应盘符。"""
+        """根据当前目录高亮对应盘符；"此电脑"层不高亮。"""
 
         current = self._local_root_path()
         index = self.drive_combo.findData(current) if current else -1
@@ -332,10 +333,9 @@ class SftpPanel(QWidget):
                     index = position
                     break
 
-        if index >= 0:
-            self.drive_combo.blockSignals(True)
-            self.drive_combo.setCurrentIndex(index)
-            self.drive_combo.blockSignals(False)
+        self.drive_combo.blockSignals(True)
+        self.drive_combo.setCurrentIndex(index)
+        self.drive_combo.blockSignals(False)
 
     def _on_drive_changed(self, _index: int) -> None:
         path = self.drive_combo.currentData()
@@ -344,12 +344,20 @@ class SftpPanel(QWidget):
             self.set_local_directory(path)
 
     def set_local_directory(self, path: str, update_path_edit: bool = True) -> bool:
-        """把本地面板切到指定目录（支持盘符根、文件路径取父目录）。"""
+        """把本地面板切到指定目录。
+
+        - 空串 / ``""`` / ``"this-pc"`` → 回到"此电脑"层（列出所有盘符）
+        - 支持盘符根（``C:/``）、普通目录、以及文件路径（取其父目录）
+        """
 
         raw = (path or "").strip().strip('"')
 
-        if not raw:
-            return False
+        if not raw or raw.lower() in ("this-pc", "此电脑", "computer"):
+            self.local_view.setRootIndex(QModelIndex())
+            self.local_path_edit.clear()
+            self._sync_drive_selection()
+
+            return True
 
         if os.path.isfile(raw):
             raw = os.path.dirname(raw)
@@ -376,6 +384,8 @@ class SftpPanel(QWidget):
         return True
 
     def local_go_up(self) -> None:
+        """上级目录；已处于盘符根时回到"此电脑"层。"""
+
         current = self._local_root_path()
 
         if not current:
@@ -383,8 +393,12 @@ class SftpPanel(QWidget):
 
         parent = str(Path(current).parent)
 
-        if parent and parent != current:
-            self.set_local_directory(parent)
+        # 盘符根（C:\ 或 C:/）的 parent 还是自己 → 退到"此电脑"
+        if not parent or parent == current:
+            self.set_local_directory("")
+            return
+
+        self.set_local_directory(parent)
 
     def local_go_home(self) -> None:
         self.set_local_directory(QDir.homePath())
@@ -698,7 +712,10 @@ class SftpPanel(QWidget):
 
             return path.parent
 
-        return Path(self.local_model.filePath(self.local_view.rootIndex()))
+        current = self._local_root_path()
+
+        # 处于"此电脑"层时没有明确目录，落到用户主目录
+        return Path(current) if current else Path(QDir.homePath())
 
     def handle_drop(self, remote_entries, local_paths, local_dir: Path) -> None:
         """处理拖放：远端条目 → 下载；本地文件 → 上传。"""

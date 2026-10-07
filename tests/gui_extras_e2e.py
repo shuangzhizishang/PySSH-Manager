@@ -311,8 +311,19 @@ def main() -> int:
         state["local_drives"] = all(checks.values())
         print("   " + " ".join(f"{name}={value}" for name, value in checks.items()), flush=True)
 
-        panel.grab().save(str(build_dir / "sftp-local-drives.png"))
-        finish()
+        # 文件列表是异步加载的，等它填充完再截图
+        def wait_rows(attempt: int = 0) -> None:
+            rows = panel.local_model.rowCount(panel.local_view.rootIndex())
+
+            if rows == 0 and attempt < 10:
+                QTimer.singleShot(300, lambda: wait_rows(attempt + 1))
+                return
+
+            print(f"   本地视图当前 {rows} 项", flush=True)
+            panel.grab().save(str(build_dir / "sftp-local-drives.png"))
+            finish()
+
+        QTimer.singleShot(400, wait_rows)
 
     def finish() -> None:
         watchdog.stop()
