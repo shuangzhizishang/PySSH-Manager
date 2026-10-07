@@ -1,0 +1,81 @@
+name: build-windows
+
+# 打 tag（v0.2.0 这类）会自动构建 Windows 程序并发布到 Releases，
+# 平时 push 到 main 也会构建一次，产物放在 Actions 的 Artifacts 里。
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: 单元测试
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 跑单元测试
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests -q
+
+  build:
+    name: 打包 Windows 程序
+    needs: test
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖（含 PyInstaller）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pillow
+
+      - name: 生成图标
+        run: python packaging/make_icon.py
+
+      - name: 打包（目录版 + 单文件版 + zip）
+        run: python packaging/build_windows.py --onefile --zip --no-selftest
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: PySSH-Manager-windows-x64
+          path: |
+            dist/*.zip
+            dist/PySSH-Manager.exe
+          if-no-files-found: error
+
+      - name: 打 tag 时发布到 Releases
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/PySSH-Manager.exe
+          generate_release_notes: true

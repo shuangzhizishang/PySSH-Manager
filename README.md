@@ -3,6 +3,32 @@
 一个用 Python + PySide6 写的 SSH 连接管理器，目标是对齐 [Termius](https://termius.com/) 的核心体验：
 真终端仿真、多标签会话、主机列表与加密凭据、密钥认证、主机指纹校验。
 
+![主界面](docs/images/e2e-window.png)
+
+| SFTP（含本地 C/D 盘） | 分屏 |
+| --- | --- |
+| ![SFTP](docs/images/sftp-local-drives.png) | ![分屏](docs/images/split-view.png) |
+
+| 同一主机多会话 | 命令库（收藏 / 历史） |
+| --- | --- |
+| ![多会话](docs/images/multi-session.png) | ![命令库](docs/images/command-library.png) |
+
+## 下载与安装（Windows）
+
+不需要装 Python，直接下载打包好的程序：
+
+1. 打开仓库的 **Releases** 页面，下载 `PySSH-Manager-<版本>-windows-x64.zip`
+   （想免解压就用 `PySSH-Manager.exe` 单文件版）
+2. 解压后双击 `PySSH-Manager.exe` 即可
+   - 目录版启动更快（推荐），单文件版只有一个 exe（首次启动会解包，稍慢）
+   - 首次连接新主机会提示服务器指纹，确认无误后点「信任」
+   - 数据（主机列表 / 加密凭据 / 命令库）保存在 `%APPDATA%\PySSH-Manager\`
+
+> **未做代码签名，Windows SmartScreen 可能提示"未知发布者"，点「更多信息 → 仍要运行」即可。**
+
+没有现成 Release 时，可以在 **Actions** 页面选最新的 `build-windows` 运行，
+在 Artifacts 里下载 `PySSH-Manager-windows-x64`（同一份产物）。
+
 ## 当前状态
 
 已经可用的功能：
@@ -64,7 +90,59 @@
   `Ctrl+Alt+C` 复制全部输出、`Ctrl+Alt+S` 保存输出、
   `Ctrl+ +/-/0` 字体缩放、`Ctrl+鼠标滚轮` 缩放
 
-命令行参数：`--host/--port/--username/--password`、`--no-autoconnect`、`--local`（附带打开本地终端）。
+命令行参数：`--host/--port/--username/--password`、`--no-autoconnect`、`--local`（附带打开本地终端）、
+`--selftest <报告路径>`（打包后的自检，见下文）。
+
+## 打包成 Windows 程序（exe）
+
+已经配好 PyInstaller，一条命令搞定（**必须在 Windows 上打包**）：
+
+```powershell
+# 装打包工具
+.venv\Scripts\python.exe -m pip install pyinstaller pillow
+
+# 目录版（推荐分发，启动快）+ 打完后自动用 exe 跑一次自检
+.venv\Scripts\python.exe packaging\build_windows.py
+
+# 单文件版 + 两个 zip（可直接上传 Release）
+.venv\Scripts\python.exe packaging\build_windows.py --onefile --zip
+
+# 顺带验证真机连通性（会连 SSH / SFTP）
+.venv\Scripts\python.exe packaging\build_windows.py --host 192.168.206.130 --username root --password 你的密码
+```
+
+产物：
+
+| 路径 | 说明 |
+| --- | --- |
+| `dist/PySSH-Manager/PySSH-Manager.exe` | 目录版，连同 `_internal/` 一起分发 |
+| `dist/PySSH-Manager.exe` | 单文件版（`--onefile`），约 53 MB |
+| `dist/PySSH-Manager-<版本>-windows-x64.zip` | 目录版压缩包（`--zip`） |
+| `dist/selftest-*.json` | 打包后自检报告 |
+
+打好的 exe 会自动跑一遍自检（GUI 构建 / ConPTY 本地终端 / SSH / SFTP），
+结果写进 JSON，全部通过才算打包成功。也可以手动跑：
+
+```powershell
+dist\PySSH-Manager\PySSH-Manager.exe --selftest report.json --host 192.168.206.130 --username root --password 密码
+```
+
+自检做的事：导入 PySide6/paramiko/pyte/cryptography/argon2/winpty、检查随包资源
+（Qt 平台插件、ConPTY 的 dll 与 exe）、建出主窗口并核对菜单动作、用 ConPTY 起本地
+shell 跑 `echo`、连一次 SSH 执行命令并列 SFTP 目录。
+
+图标可以重新生成：`packaging\make_icon.py`（纯代码画图，输出 `packaging/icon.ico`）。
+
+## 持续集成 / 自动发布
+
+`.github/workflows/build-windows.yml` 会在 push 时跑单元测试并打包，
+在 Actions 页面以 Artifact 形式提供产物；**打 `v*` 标签**（例如 `v0.2.0`）时会自动
+创建 Release 并把 zip 与单文件 exe 传上去：
+
+```powershell
+git tag v0.2.0
+git push origin v0.2.0
+```
 
 ## 快速开始
 
@@ -108,19 +186,30 @@ sshmanager/
   localsession.py           本地终端会话（ConPTY / pywinpty）
   sftpcore.py               SFTP 操作（列目录/收发/增删改，不依赖 Qt）
   sftpworker.py             SFTP 后台线程（任务队列）
+  fileops.py                文件剪贴板与撤销栈（复制/剪切/粘贴/撤销，四个方向）
+  fileworker.py             本地文件操作后台线程（复制/移动/回收站/删除）
+  commands.py               命令库：收藏、历史、条目剪贴板与撤销
+  selftest.py               打包后自检（依赖/资源/界面/本地终端/SSH/SFTP）
   forwarding.py             三类端口转发（-L / -R / SOCKS5 -D）
   terminal/
     core.py                 pyte 封装 + 键盘序列编码
-    view.py                 终端控件：网格渲染、选区、滚动、快捷键
+    view.py                 终端控件：网格渲染、选区、滚动、快捷键、输出导出
   ui/
     main_window.py          主窗口：主机侧边栏 + 多标签（终端 / 分屏 / SFTP / 本地终端）
     host_dialog.py          新建/编辑主机（含「信任并记住指纹」）
     session_tab.py          会话标签（TerminalTab / SessionTab / LocalTerminalTab）
     split_tab.py            分屏容器
-    sftp_panel.py           SFTP 双栏面板（含拖拽与递归传输）
+    sftp_panel.py           SFTP 双栏面板（含拖拽、递归传输、复制/剪切/粘贴/撤销）
+    command_library.py      命令库对话框（收藏 / 历史 / 条目操作）
     forward_dialog.py       端口转发管理对话框（三种类型）
     key_dialog.py           密钥管理对话框
     replay_dialog.py        录制回放对话框
+packaging/
+  make_icon.py              生成应用图标（纯代码画图）
+  PySSH-Manager.spec        PyInstaller 配置（精简 Qt 模块、打包 ConPTY 组件）
+  build_windows.py          一键打包 + 自检 + 打 zip
+.github/workflows/
+  build-windows.yml         CI：单元测试 + 打包 + 打 tag 自动发 Release
 tests/
   test_terminal.py          终端仿真核心单测
   test_terminal_view.py     滚动与排版回归测试
@@ -157,7 +246,7 @@ $env:QT_QPA_PLATFORM='offscreen'
 # 真实 SSH 冒烟（连测试机执行命令并校验 ANSI 解析）
 .venv\Scripts\python.exe tests\ssh_smoke.py --host 192.168.206.130 --trust
 
-# 真实 GUI 端到端（会短暂弹窗，并把截图写到 build/）
+# 真实 GUI 端到端（会短暂弹窗，并把截图写到 build/，被 .gitignore 忽略）
 .venv\Scripts\python.exe tests\gui_e2e.py --host 192.168.206.130 --password <密码>
 
 # SFTP + 端口转发真实链路（上传/下载/重命名/删除 + ssh -L 回传校验）

@@ -46,12 +46,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="启动时额外打开一个本地终端标签",
     )
+    parser.add_argument(
+        "--selftest",
+        metavar="报告路径",
+        default="",
+        help="自检模式：检查依赖/界面/本地终端/SSH 后把结果写入 JSON 再退出（打包后验证用）",
+    )
 
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+
+    # 自检模式：不开主界面，检查完写报告就退出（打包后的 exe 没有控制台）
+    if args.selftest:
+        from sshmanager.selftest import run as run_selftest
+
+        report = run_selftest(
+            args.selftest,
+            host="" if args.no_autoconnect else args.host,
+            port=args.port,
+            username=args.username,
+            password=args.password,
+        )
+        return 0 if report.get("ok") else 1
 
     from PySide6.QtWidgets import QApplication
 

@@ -2,14 +2,28 @@
 .venv/
 venv/
 
-# PyCharm
+# PyCharm / 编辑器
 .idea/
+.vscode/
 
 # Python 缓存
 __pycache__/
 *.py[cod]
 *.egg-info/
 
-# 运行期数据（主机列表、凭据）不进版本库
+# 运行期数据（主机列表、凭据、命令库）不进版本库
 data/
 *.log
+
+# 打包产物与中间目录
+dist/
+build/
+*.spec.bak
+
+# 自检报告
+selftest-*.json
+
+# 系统垃圾
+Thumbs.db
+desktop.ini
+.DS_Store
