@@ -201,6 +201,30 @@ class SftpClient:
         except Exception as error:  # noqa: BLE001
             raise SFTPError(f"重命名失败：{error}") from error
 
+    def read_bytes(self, path: str) -> bytes:
+        """读整个远端文件（用于远端内部复制）。"""
+
+        try:
+            with self._client().open(normalize_remote_path(path), "rb") as handle:
+                return handle.read()
+        except Exception as error:  # noqa: BLE001
+            raise SFTPError(f"读取失败：{path}（{error}）") from error
+
+    def write_bytes(self, path: str, payload: bytes) -> None:
+        """写整个远端文件；必要时自动创建父目录。"""
+
+        target = normalize_remote_path(path)
+        parent = posixpath.dirname(target)
+
+        if parent and parent != "/":
+            self.mkdir_p(parent)
+
+        try:
+            with self._client().open(target, "wb") as handle:
+                handle.write(payload)
+        except Exception as error:  # noqa: BLE001
+            raise SFTPError(f"写入失败：{target}（{error}）") from error
+
     # ------------------------------------------------------------------
 
     def exists(self, path: str, is_dir: bool | None = None) -> bool:
