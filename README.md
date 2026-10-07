@@ -17,6 +17,16 @@
 - **主机指纹校验**：使用应用自己的 `known_hosts`，未知主机给出带指纹的明确提示，可一键信任
 - **跳板机**：通过另一台主机建立 direct-tcpip 隧道
 - **本地终端**：应用内嵌 Windows ConPTY 伪终端（PowerShell / cmd），标签里直接跑本机命令
+- **命令输入栏**：每个终端下方一个命令输入框——写命令（支持多行脚本，Enter 发送、
+  Shift+Enter 换行），框内可用系统习惯的 `Ctrl+C/X/V/Z` 复制/剪切/粘贴/撤销；
+  发送的命令自动进历史。**Windows→Linux** = 把框里/命令库里的命令发到远端
+- **命令库（收藏 + 历史）**：常用命令按主机或全局收藏，可分组、加备注、记录使用次数；
+  历史自动记录执行过的命令（连续重复只留一条），可搜索、再次发送、一键收藏；
+  条目本身支持**复制 / 剪切 / 粘贴到别的分组 / 撤销**（`Ctrl+C/X/V/Z`，删除也能撤销）
+- **终端剪贴板（双向）**：`Linux→Windows`——鼠标选中即复制（可关）、`Ctrl+Shift+C` 复制、
+  `Ctrl+Shift+X` 剪切（复制并清空选区）、一键「复制全部输出」；
+  `Windows→Linux`——`Ctrl+Shift+V` 把 Windows 剪贴板粘进远端
+- **输出导出**：把终端全部输出（含回滚区）复制到剪贴板或另存为 UTF-8 文本文件
 - **分屏**：左右 / 上下分屏，最多 4 个面板，每个面板是独立的 SSH 会话，分隔条可拖动调整
 - **同一主机多会话**：`Ctrl+Shift+N`（或右键「新会话」）可给一台主机开多条并行会话，
   标签按 `(1)(2)(3)` 编号，侧边栏主机条目显示 `×N`（开着的会话数）；
@@ -48,7 +58,9 @@
   `Ctrl+Shift+F` SFTP、`Ctrl+Shift+P` 端口转发、`Ctrl+Shift+T` 本地终端、
   `Ctrl+Shift+K` 密钥管理、`Ctrl+Shift+R` 开始/停止录制、
   `Ctrl+Shift+E` 左右分屏、`Ctrl+Shift+O` 上下分屏、
-  `Ctrl+Shift+W` 切换分屏焦点、`Ctrl+Shift+C/V` 复制粘贴、
+  `Ctrl+Shift+W` 切换分屏焦点、`Ctrl+Shift+C/V` 复制粘贴、`Ctrl+Shift+X` 剪切、
+  `Ctrl+`` 命令输入栏、`Ctrl+Shift+L` 命令库、`Ctrl+Alt+C` 复制全部输出、
+  `Ctrl+Alt+S` 保存输出、
   `Ctrl+ +/-/0` 字体缩放、`Ctrl+鼠标滚轮` 缩放
 
 命令行参数：`--host/--port/--username/--password`、`--no-autoconnect`、`--local`（附带打开本地终端）。
@@ -167,9 +179,15 @@ $env:QT_QPA_PLATFORM='offscreen'
 
 # 会话录制/回放 + SFTP 断点续传
 .venv\Scripts\python.exe tests\recording_resume_e2e.py --host 192.168.206.130 --password <密码>
+
+# 命令输入栏 / 命令库 / 输出回拷 / 终端剪切
+.venv\Scripts\python.exe tests\command_features_e2e.py --host 192.168.206.130 --password <密码>
+
+# SFTP 复制/剪切/粘贴/撤销（四个方向 + 回收站）
+.venv\Scripts\python.exe tests\copy_paste_e2e.py --host 192.168.206.130 --password <密码>
 ```
 
-## 七个已踩过的坑（改动时注意）
+## 八个已踩过的坑（改动时注意）
 
 1. **必须使用 Fusion 样式**：Qt 6.11 在 Windows 上默认用 `windows11` 原生样式，
    该样式会忽略自定义 `QPainter` 的画笔颜色，终端文字会被画成系统默认文字色，
@@ -201,3 +219,10 @@ $env:QT_QPA_PLATFORM='offscreen'
    会登记到模块级列表，避免 QThread 在运行时被回收。测试脚本用 `os._exit()` 报告结论，
    跳过解释器退出阶段——PySide6 6.11 + Python 3.14 下退出时可能因一个 C 层残留线程
    触发访问违例，把已经正确的结论变成非零退出码。
+8. **终端标签只从 `tabs_widget` 现算，不要再维护登记表**：早期用
+   `self.tabs: 主机id → 标签列表` 做登记，而 `_tabs_for_host()` 是从控件现算的，
+   `connect_host` 对它 `.append()` 等于往临时列表里加——登记表一直是空的，
+   退出时遍历登记表就漏关了会话。现在统一用 `_all_host_tabs()` /
+   `_tabs_for_host()`（都从 `tabs_widget` 现算），新增标签无需再登记。
+   另：Qt 里用 `focusWidget()` 判断"当前是哪一栏"在窗口未激活时拿不到焦点，
+   需要额外记录最后一次交互的栏（见 SFTP 面板的 `_active_side`）。

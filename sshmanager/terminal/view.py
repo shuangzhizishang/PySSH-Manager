@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetricsF, QGuiApplication, QPainter
 from PySide6.QtWidgets import QAbstractScrollArea
@@ -59,6 +61,9 @@ class TerminalView(QAbstractScrollArea):
     #: 标题变化（OSC 0/2）
     title_changed = Signal(str)
 
+    #: 有内容被复制到 Windows 剪贴板（Linux→Windows）
+    copied = Signal(str)
+
     def __init__(self, columns: int = 120, rows: int = 32, parent=None) -> None:
         super().__init__(parent)
 
@@ -67,6 +72,9 @@ class TerminalView(QAbstractScrollArea):
         self._theme = dict(THEME)
         self._font = self._pick_font(None, 12)
         self._cell = self._measure(self._font)
+
+        #: 鼠标松开时自动把选中内容复制到 Windows 剪贴板（PuTTY 风格）
+        self.select_to_copy = True
 
         # 回滚：offset 表示视口相对「屏幕顶部」向上偏移的行数
         self._offset = 0
@@ -547,6 +555,14 @@ class TerminalView(QAbstractScrollArea):
     def mouseReleaseEvent(self, event):  # noqa: N802
         self._selecting = False
 
+        # 选中即复制（PuTTY 风格，可在菜单里关掉）：把远端内容带到 Windows
+        if self.select_to_copy:
+            text = self.selected_text()
+
+            if text:
+                QGuiApplication.clipboard().setText(text)
+                self.copied.emit(text)
+
     def selected_text(self) -> str:
         selection = self._selection_range()
 
@@ -575,6 +591,74 @@ class TerminalView(QAbstractScrollArea):
 
         if text:
             QGuiApplication.clipboard().setText(text)
+            self.copied.emit(text)
+
+    def cut(self) -> None:
+        """剪切：复制选中内容到 Windows 剪贴板，并清掉本机的高亮选区。
+
+        远端屏幕内容不受影响（终端是远端渲染的，本地删不掉），
+        所以"剪切"在这里等于"复制 + 取消选中"，语义与终端习惯一致。
+        """
+
+        text = self.selected_text()
+
+        if not text:
+            return
+
+        QGuiApplication.clipboard().setText(text)
+        self.clear_selection()
+        self.copied.emit(text)
+
+    def clear_selection(self) -> None:
+        self._anchor = None
+        self._cursor_cell = None
+        self._selecting = False
+        self.viewport().update()
+
+    def output_text(self, include_history: bool = True) -> str:
+        """把终端输出取成纯文本：回滚区（可选）+ 当前屏幕。"""
+
+        lines: list[str] = []
+
+        if include_history:
+            history = self._history_top
+
+            for index in range(len(history)):
+                line = self._history_line(index)
+
+                if line is None:
+                    continue
+
+                lines.append("".join(cell.data for cell in line).rstrip())
+
+        for row in range(self.emulator.lines):
+            lines.append(self._row_text(row).rstrip())
+
+        # 去掉尾部空行
+        while lines and not lines[-1]:
+            lines.pop()
+
+        return "\n".join(lines)
+
+    def copy_all_output(self, include_history: bool = True) -> str:
+        """复制全部输出到 Windows 剪贴板（Linux→Windows）。"""
+
+        text = self.output_text(include_history=include_history)
+
+        if text:
+            QGuiApplication.clipboard().setText(text)
+            self.copied.emit(text)
+
+        return text
+
+    def save_output(self, path: Path, include_history: bool = True) -> int:
+        """把输出保存成文件，返回写入字节数。"""
+
+        text = self.output_text(include_history=include_history)
+        payload = text + "\n"
+        Path(path).write_text(payload, encoding="utf-8")
+
+        return len(payload.encode("utf-8"))
 
     def paste(self) -> None:
         text = QGuiApplication.clipboard().text()

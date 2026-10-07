@@ -10,13 +10,16 @@ from __future__ import annotations
 import uuid
 
 from PySide6.QtCore import QTimer, Signal
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFileDialog, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
+from ..commands import get_store
 from ..hosts import Host
 from ..localsession import LocalShellSession
 from ..session import SSHSession
 from ..sshclient import SSHClient
 from ..terminal.view import TerminalView
+from .command_bar import CommandBar
+from .command_library import CommandLibraryDialog
 
 LOCAL_ID = "local"
 
@@ -94,16 +97,108 @@ class TerminalTab(QWidget):
         self.view.data_to_send.connect(self._on_input)
         self.view.terminal_resized.connect(self._on_resized)
         self.view.title_changed.connect(self._on_title)
+        self.view.copied.connect(self._on_copied)
 
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(0)
-        self._layout.addWidget(self.view)
+        self._layout.addWidget(self.view, 1)
+
+        # 命令输入栏：写命令（Windows→Linux）、把输出拷回 Windows、收藏命令
+        self.command_bar = CommandBar()
+        self.command_bar.command_requested.connect(self.send_command)
+        self.command_bar.favorite_requested.connect(self.favorite_command)
+        self.command_bar.copy_output_requested.connect(self.copy_output)
+        self.command_bar.save_output_requested.connect(self.save_output)
+        self.command_bar.library_requested.connect(self.open_command_library)
+        self.command_bar.close_requested.connect(lambda: self.set_command_bar_visible(False))
+        self._layout.addWidget(self.command_bar)
 
         if host is not None:
             self.view.apply_font(host.font_family, host.font_size)
 
         self.session = None
+
+    # ------------------------------------------------------------------
+    # 命令输入栏
+    # ------------------------------------------------------------------
+
+    def set_command_bar_visible(self, visible: bool) -> None:
+        self.command_bar.setVisible(bool(visible))
+
+    def toggle_command_bar(self) -> None:
+        self.set_command_bar_visible(not self.command_bar.isVisible())
+
+    @property
+    def command_bar_visible(self) -> bool:
+        return self.command_bar.isVisible()
+
+    def send_command(self, text: str) -> None:
+        """把文本作为命令发送到远端（多行会逐行执行），并记进命令历史。"""
+
+        payload = (text or "").strip("\n")
+
+        if not payload.strip():
+            return
+
+        store = get_store()
+        store.record_history(payload, self._host_id())
+
+        # 终端要求 \r 作为换行；多行脚本逐行下发
+        normalized = payload.replace("\r\n", "\n").replace("\r", "\n")
+        data = normalized.replace("\n", "\r") + "\r"
+        self._on_input(data.encode("utf-8"))
+        self.command_bar.set_status(f"已发送 {len(normalized.splitlines())} 行到 Linux")
+
+    def favorite_command(self, text: str) -> None:
+        text = (text or "").strip()
+
+        if not text:
+            self.command_bar.set_status("输入框为空，先写点命令再收藏")
+            return
+
+        snippet = get_store().add(text, host_id=self._host_id())
+
+        if snippet is None:
+            self.command_bar.set_status("这条命令已经在收藏里了")
+            return
+
+        self.command_bar.set_status("已收藏到命令库（Ctrl+Shift+L 打开）")
+
+    def open_command_library(self) -> None:
+        dialog = CommandLibraryDialog(
+            get_store(),
+            host_id=self._host_id(),
+            host_label=self.display_name,
+            parent=self,
+        )
+        dialog.send_requested.connect(self.send_command)
+        dialog.exec()
+
+    def copy_output(self) -> None:
+        text = self.view.copy_all_output()
+
+        if text:
+            self.command_bar.set_status(f"已复制 {len(text.splitlines())} 行输出到 Windows 剪贴板")
+        else:
+            self.command_bar.set_status("终端还没有输出")
+
+    def save_output(self) -> None:
+        default = f"{self.display_name.replace(':', '_').replace('/', '_')}-输出.txt".replace(" ", "_")
+        path, _ = QFileDialog.getSaveFileName(self, "保存终端输出", default, "文本文件 (*.txt);;所有文件 (*)")
+
+        if not path:
+            return
+
+        size = self.view.save_output(path)
+        self.command_bar.set_status(f"已保存到 {path}（{size} 字节）")
+
+    def _host_id(self) -> str:
+        return self.host.id if self.host is not None else LOCAL_ID
+
+    def _on_copied(self, text: str) -> None:
+        if self.command_bar.isVisible():
+            self.command_bar.set_status(f"已复制 {len(text)} 字符到 Windows 剪贴板")
 
     # ------------------------------------------------------------------
 

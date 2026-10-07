@@ -74,7 +74,8 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
 
         self.context = context
-        self.tabs: dict[str, list] = {}  # 主机 id → 该主机的终端标签列表（支持多会话）
+        #: 说明：终端标签统一从 tabs_widget 现算（见 _all_host_tabs / _tabs_for_host），
+        #: 不再维护单独的登记表——曾经两者不同步导致退出时漏关会话。
         self.sftp_tabs: dict[str, SftpPanel] = {}
         self.local_tabs: dict[str, LocalTerminalTab] = {}
         self.replay_dialog = None
@@ -157,6 +158,27 @@ class MainWindow(QMainWindow):
         self.action_record.setShortcut(QKeySequence("Ctrl+Shift+R"))
         self.action_record.triggered.connect(self.toggle_recording)
 
+        self.action_toggle_command_bar = QAction("命令输入栏", self)
+        self.action_toggle_command_bar.setShortcut(QKeySequence("Ctrl+`"))
+        self.action_toggle_command_bar.setToolTip("显示/隐藏命令输入框（Enter 发送到 Linux）")
+        self.action_toggle_command_bar.triggered.connect(self.toggle_command_bar)
+
+        self.action_command_library = QAction("命令库（收藏 / 历史）", self)
+        self.action_command_library.setShortcut(QKeySequence("Ctrl+Shift+L"))
+        self.action_command_library.triggered.connect(self.open_command_library)
+
+        self.action_copy_output = QAction("复制全部输出到 Windows", self)
+        self.action_copy_output.setShortcut(QKeySequence("Ctrl+Alt+C"))
+        self.action_copy_output.triggered.connect(self.copy_all_output)
+
+        self.action_save_output = QAction("保存输出到文件…", self)
+        self.action_save_output.setShortcut(QKeySequence("Ctrl+Alt+S"))
+        self.action_save_output.triggered.connect(self.save_all_output)
+
+        self.action_select_to_copy = QAction("选中即复制（Linux→Windows）", self)
+        self.action_select_to_copy.setToolTip("鼠标选中终端文字后自动复制到 Windows 剪贴板")
+        self.action_select_to_copy.toggled.connect(self.set_select_to_copy)
+
         self.action_replay = QAction("回放录制…", self)
         self.action_replay.triggered.connect(self.open_replay)
 
@@ -236,6 +258,16 @@ class MainWindow(QMainWindow):
         edit_menu = self.menuBar().addMenu("编辑")
         edit_menu.addAction(self.action_copy)
         edit_menu.addAction(self.action_paste)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.action_toggle_command_bar)
+        edit_menu.addAction(self.action_command_library)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.action_copy_output)
+        edit_menu.addAction(self.action_save_output)
+        edit_menu.addSeparator()
+        self.action_select_to_copy.setCheckable(True)
+        self.action_select_to_copy.setChecked(True)
+        edit_menu.addAction(self.action_select_to_copy)
 
         self.host_list = QListWidget()
         self.host_list.setMinimumWidth(220)
@@ -261,6 +293,7 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(splitter)
         self.statusBar().showMessage("就绪")
+        self._sync_command_actions()
 
     # ------------------------------------------------------------------
     # 主机列表
@@ -508,11 +541,11 @@ class MainWindow(QMainWindow):
         self.tabs_widget.setTabToolTip(index, host.target)
         self.tabs_widget.setCurrentIndex(index)
 
-        self._tabs_for_host(host.id).append(tab)
         self._refresh_tab_title(host)
         self.context.hosts.mark_connected(host.id)
         self.refresh_hosts()
         self._update_window_title()
+        self._sync_command_actions()
 
     # ------------------------------------------------------------------
     # 同一主机多会话的辅助
@@ -634,9 +667,17 @@ class MainWindow(QMainWindow):
         return [*self._all_host_tabs(), *self.local_tabs.values()]
 
     def _all_host_tabs(self) -> list:
-        """所有主机终端标签（同一主机可能有多条）。"""
+        """所有主机终端标签（同一主机可能有多条）。
 
-        return [tab for tabs in self.tabs.values() for tab in tabs]
+        直接从标签控件现算，避免与登记表不同步——曾经用 self.tabs 做登记表，
+        普通连接路径把标签追加到了临时列表上，导致退出时漏关会话。
+        """
+
+        return [
+            self.tabs_widget.widget(row)
+            for row in range(self.tabs_widget.count())
+            if isinstance(self.tabs_widget.widget(row), (SessionTab, SplitTerminalTab))
+        ]
 
     def _ensure_credential(self, host: Host) -> str | None:
         """取主机凭据；密码认证且没有保存过时，向用户询问一次并加密保存。"""
@@ -725,15 +766,18 @@ class MainWindow(QMainWindow):
 
         clients = {host_id: client for host_id, client in self.context.jump_clients.items() if client.is_connected()}
 
-        for host_id, tabs in self.tabs.items():
-            for tab in tabs:
-                pane = tab.active_pane() if isinstance(tab, SplitTerminalTab) else tab
-                session = getattr(pane, "session", None)
-                client = getattr(session, "client", None)
+        for tab in self._all_host_tabs():
+            host = getattr(tab, "host", None)
 
-                if client is not None and client.is_connected():
-                    clients[host_id] = client
-                    break
+            if host is None:
+                continue
+
+            pane = tab.active_pane() if isinstance(tab, SplitTerminalTab) else tab
+            session = getattr(pane, "session", None)
+            client = getattr(session, "client", None)
+
+            if client is not None and client.is_connected():
+                clients.setdefault(host.id, client)
 
         return clients
 
@@ -1052,20 +1096,10 @@ class MainWindow(QMainWindow):
         self.tabs_widget.setTabToolTip(new_index, host.target)
         self.tabs_widget.setCurrentIndex(new_index)
 
-        # 同一个 SessionTab 被装进分屏容器：把它在列表里替换掉
-        tabs = self._tabs_for_host(host.id)
-
-        for position, candidate in enumerate(tabs):
-            if candidate is widget:
-                tabs[position] = split
-                break
-        else:
-            tabs.append(split)
-
-        self.tabs[host.id] = tabs
         split.add_pane(activate=True)
         self._refresh_tab_title(host)
         self._update_window_title()
+        self._sync_command_actions()
 
     def focus_next_pane(self) -> None:
         widget = self.tabs_widget.currentWidget()
@@ -1313,6 +1347,7 @@ class MainWindow(QMainWindow):
                 widget.active_pane().view.setFocus()
 
         self._update_window_title()
+        self._sync_command_actions()
 
     # ------------------------------------------------------------------
     # 标签管理
@@ -1343,21 +1378,15 @@ class MainWindow(QMainWindow):
             widget.close()
             self.tabs_widget.removeTab(index)
 
-            tabs = self._tabs_for_host(host.id)
-
-            # 注意：removeTab 之后该控件已不在 tabs_widget 里，所以按对象比对
-            remaining = [tab for tab in tabs if tab is not widget]
-
-            if remaining:
-                self.tabs[host.id] = remaining
+            # removeTab 之后该控件已不在 tabs_widget 里，剩下的标签标签名重新编号
+            if self._tabs_for_host(host.id):
                 self._refresh_tab_title(host)
-            else:
-                self.tabs.pop(host.id, None)
         else:
             return
 
         self._update_window_title()
         self.refresh_hosts()
+        self._sync_command_actions()
 
     def reconnect_current(self) -> None:
         widget = self.tabs_widget.currentWidget()
@@ -1404,6 +1433,112 @@ class MainWindow(QMainWindow):
 
         if pane is not None:
             pane.view.copy()
+
+    # ------------------------------------------------------------------
+    # 命令：输入栏 / 命令库 / 输出导出
+    # ------------------------------------------------------------------
+
+    def _all_terminal_panes(self) -> list:
+        """当前标签里的所有终端面板（分屏时返回所有面板）。"""
+
+        widget = self.tabs_widget.currentWidget()
+
+        if isinstance(widget, SessionTab):
+            return [widget]
+
+        if isinstance(widget, SplitTerminalTab):
+            return list(widget.panes)
+
+        return []
+
+    def _sync_command_actions(self) -> None:
+        """命令相关菜单项只在当前标签是终端时可用。"""
+
+        has_terminal = bool(self._all_terminal_panes())
+
+        for action in (
+            self.action_toggle_command_bar,
+            self.action_command_library,
+            self.action_copy_output,
+            self.action_save_output,
+        ):
+            action.setEnabled(has_terminal)
+
+    def toggle_command_bar(self) -> None:
+        panes = self._all_terminal_panes()
+
+        if not panes:
+            self.statusBar().showMessage("当前标签没有终端")
+            return
+
+        # 以第一个面板为准统一切换，避免分屏里有的显示有的隐藏
+        show = not panes[0].command_bar_visible
+
+        for pane in panes:
+            pane.set_command_bar_visible(show)
+
+        if show:
+            panes[0].command_bar.focus_input()
+
+        self.statusBar().showMessage(f"命令输入栏已{'显示' if show else '收起'}")
+
+    def open_command_library(self) -> None:
+        from ..commands import get_store
+        from .command_library import CommandLibraryDialog
+
+        pane = self._focused_terminal()
+        host_id = pane.host.id if pane is not None and pane.host is not None else ""
+        label = pane.display_name if pane is not None else "全局"
+
+        dialog = CommandLibraryDialog(get_store(), host_id=host_id, host_label=label, parent=self)
+
+        if pane is not None:
+            dialog.send_requested.connect(pane.send_command)
+
+        dialog.exec()
+
+    def copy_all_output(self) -> None:
+        pane = self._focused_terminal()
+
+        if pane is None:
+            self.statusBar().showMessage("当前没有活动会话")
+            return
+
+        text = pane.view.copy_all_output()
+        self.statusBar().showMessage(
+            f"已复制 {len(text.splitlines())} 行输出到 Windows 剪贴板" if text else "终端还没有输出"
+        )
+
+    def save_all_output(self) -> None:
+        pane = self._focused_terminal()
+
+        if pane is None:
+            self.statusBar().showMessage("当前没有活动会话")
+            return
+
+        pane.save_output()
+
+    def set_select_to_copy(self, enabled: bool) -> None:
+        for pane in self._all_terminal_panes_all():
+            view = getattr(pane, "view", None)
+
+            if view is not None:
+                view.select_to_copy = bool(enabled)
+
+        self.statusBar().showMessage(f"选中即复制：{'开启' if enabled else '关闭'}")
+
+    def _all_terminal_panes_all(self) -> list:
+        """所有标签（含所有分屏面板与本地终端）里的终端面板。"""
+
+        panes = []
+
+        for tab in self._iter_terminal_tabs():
+            if isinstance(tab, SplitTerminalTab):
+                panes.extend(tab.panes)
+            else:
+                panes.append(tab)
+
+        return panes
 
     def paste_to_terminal(self) -> None:
         pane = self._focused_terminal()
@@ -1481,7 +1616,6 @@ class MainWindow(QMainWindow):
                         pass
 
         self.context.close()
-        self.tabs.clear()
         self.local_tabs.clear()
         self.sftp_tabs.clear()
 
