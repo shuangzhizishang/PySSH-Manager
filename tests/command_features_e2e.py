@@ -217,8 +217,13 @@ def main() -> int:
         app.processEvents()
         dialog.send_selected()
         app.processEvents()
+        dialog.grab().save(str(Path(__file__).resolve().parent.parent / "build" / "command-library.png"))
 
         ok = wait_for(lambda: "PSSH-FROM-LIBRARY" in terminal_text())
+
+        build_dir = Path(__file__).resolve().parent.parent / "build"
+        build_dir.mkdir(parents=True, exist_ok=True)
+        window.grab().save(str(build_dir / "command-bar.png"))
 
         # 命令库条目操作：复制 → 粘贴到新分组 → 撤销
         before = len(store.snippets)
