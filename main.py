@@ -118,7 +118,17 @@ def main(argv: list[str] | None = None) -> int:
         if host is not None:
             window.connect_host(host)
 
-    return app.exec()
+    exit_code = app.exec()
+
+    # 兜底：即使有会话正在连接/认证中途被关窗，也要把连接与传输层线程收干净，
+    # 否则解释器退出阶段可能崩溃（access violation）。
+    from sshmanager.sshclient import close_all_clients
+    from sshmanager.ui.session_tab import drain_sessions
+
+    close_all_clients()
+    drain_sessions()
+
+    return exit_code
 
 
 if __name__ == "__main__":

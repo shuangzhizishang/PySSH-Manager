@@ -214,7 +214,13 @@ def main() -> int:
 
     def finish() -> None:
         watchdog.stop()
-        window.close()
+        window.shutdown()
+
+        from sshmanager.sshclient import close_all_clients
+        from sshmanager.ui.session_tab import drain_sessions
+
+        close_all_clients()
+        drain_sessions(timeout=8)
         app.quit()
 
     QTimer.singleShot(300, step_record)
@@ -228,7 +234,9 @@ def main() -> int:
     ok = all(state.values())
     print("RECORDING_RESUME_E2E_OK" if ok else "RECORDING_RESUME_E2E_FAILED", flush=True)
 
-    return 0 if ok else 1
+    # 跳过解释器退出阶段（PySide6 6.11 + Python 3.14 退出期可能因 C 层残留线程崩溃）
+    sys.stdout.flush()
+    os._exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

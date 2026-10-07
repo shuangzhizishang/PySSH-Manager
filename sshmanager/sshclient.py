@@ -28,6 +28,41 @@ class HostKeyMismatch(paramiko.SSHException):
     """服务器指纹与 known_hosts 不一致，可能遭遇中间人攻击。"""
 
 
+#: 所有仍存活的连接。进程退出前用它做一次兜底收尾：即使界面上已经来不及
+#: join 线程（例如"正在连接时就关窗"），也能保证 paramiko 的传输层线程停下来，
+#: 否则解释器退出阶段可能崩溃（access violation）。
+_LIVE_CLIENTS: "set[SSHClient]" = set()
+_LIVE_LOCK = threading.Lock()
+
+
+def close_all_clients(timeout: float = 3.0) -> int:
+    """关闭所有登记在册的连接并等待其传输层线程结束，返回关闭数量。"""
+
+    with _LIVE_LOCK:
+        clients = list(_LIVE_CLIENTS)
+
+    for client in clients:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+    # 再等一次传输层线程（close() 内部已经 join 过，这里兜底处理新出现的）
+    for client in clients:
+        transport = getattr(client, "transport", None)
+
+        if transport is not None:
+            try:
+                transport.join(timeout=timeout)
+            except Exception:
+                pass
+
+    with _LIVE_LOCK:
+        remaining = len(_LIVE_CLIENTS)
+
+    return len(clients) - remaining
+
+
 class _Policy(paramiko.MissingHostKeyPolicy):
     """未知主机：给出带指纹的明确错误，而不是静默接受。"""
 
@@ -119,6 +154,9 @@ class SSHClient:
         self.channel: paramiko.Channel | None = None
         self._sock: socket.socket | None = None
         self._lock = threading.Lock()
+
+        with _LIVE_LOCK:
+            _LIVE_CLIENTS.add(self)
 
     # ------------------------------------------------------------------
     # 连接
@@ -318,13 +356,41 @@ class SSHClient:
             self.client = None
             self._sock = None
 
-        # 顺序：通道 → 传输层（停掉 paramiko 读线程）→ 客户端 → 原始 socket
-        for resource in (channel, transport, client, sock):
+        with _LIVE_LOCK:
+            _LIVE_CLIENTS.discard(self)
+
+        # 顺序很关键（Windows 上尤其）：
+        # 1) 先 shutdown 底层 socket —— 只是 close() 并不能唤醒另一个线程里阻塞的
+        #    recv，必须 shutdown(SHUT_RDWR) 才能让 paramiko 传输层线程从 recv 返回；
+        #    这一步必须在 close 之前做，否则 socket 已关闭、shutdown 会失败。
+        # 2) 关通道，让读取通道的线程看到 EOF。
+        # 3) 关传输层与客户端。
+        # 4) 最后 join 传输层线程，确认它真的退出了。
+        # 不做这些的话，线程会一直卡在 recv 上，进程退出阶段崩溃（access violation）。
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        for resource in (channel, transport, client):
             if resource is None:
                 continue
 
             try:
                 resource.close()
+            except Exception:
+                pass
+
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+        if transport is not None:
+            try:
+                transport.join(timeout=3.0)
             except Exception:
                 pass
 

@@ -1,4 +1,4 @@
-"""新增功能的 GUI 与链路验证：密钥管理、标签分组、拖拽递归传输。
+"""新增功能的 GUI 与链路验证：密钥管理、标签分组、拖拽递归传输、多会话、本地盘符。
 
 会短暂弹窗并截图到 build/。
 
@@ -10,11 +10,15 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
+
+faulthandler.enable()
 
 # 测试必须与真实数据目录隔离，避免污染主机列表与凭据
 os.environ.setdefault("PYSSH_DATA_DIR", tempfile.mkdtemp(prefix="pyssh-extras-"))
@@ -38,7 +42,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=22)
     parser.add_argument("--username", default="root")
     parser.add_argument("--password", default="")
-    parser.add_argument("--timeout", type=float, default=90.0)
+    parser.add_argument("--timeout", type=float, default=180.0)
     args = parser.parse_args()
 
     app = QApplication(sys.argv[:1])
@@ -67,6 +71,8 @@ def main() -> int:
         "key_generated": False,
         "host_groups": False,
         "recursive_transfer": False,
+        "multi_session": False,
+        "local_drives": False,
     }
 
     deadline = time.time() + args.timeout
@@ -233,11 +239,96 @@ def main() -> int:
         except Exception:
             pass
 
+        QTimer.singleShot(200, step_multi_session)
+
+    # ------------------------------------------------------------------
+    # 4) 同一主机多会话
+    # ------------------------------------------------------------------
+    def step_multi_session() -> None:
+        # 当前已有 1 条会话，再强制开两条
+        window.connect_host(host, force_new=True)
+        window.connect_host(host, force_new=True)
+
+        def check() -> None:
+            tabs = window._tabs_for_host(host.id)
+            ready = 0
+
+            for tab in tabs:
+                pane = tab.active_pane() if hasattr(tab, "active_pane") else tab
+
+                if pane is not None and any(m in pane.view.emulator.plain_text() for m in ("#", "$", ">")):
+                    ready += 1
+
+            # SSH 认证需要几秒，给足时间等三条都连上
+            if (len(tabs) < 3 or ready < 3) and time.time() < deadline:
+                QTimer.singleShot(600, check)
+                return
+
+            titles = [window.tabs_widget.tabText(window.tabs_widget.indexOf(tab)) for tab in tabs]
+
+            state["multi_session"] = len(tabs) >= 3 and ready >= 3
+            print(f"4. 多会话：标签 {len(tabs)} 个 → {titles}，已连接 {ready} 条", flush=True)
+
+            window.grab().save(str(build_dir / "multi-session.png"))
+            QTimer.singleShot(200, step_local_drives)
+
+        QTimer.singleShot(400, check)
+
+    # ------------------------------------------------------------------
+    # 5) 本地盘符：C: / D: 全部可见且能切换
+    # ------------------------------------------------------------------
+    def step_local_drives() -> None:
+        panel = window.sftp_tabs.get(host.id)
+
+        if panel is None:
+            print("SFTP 面板不存在，跳过盘符检查", flush=True)
+            finish()
+            return
+
+        panel._reload_drives()
+        drives = [str(panel.drive_combo.itemData(index)) for index in range(panel.drive_combo.count())]
+        print(f"5. 盘符列表：{drives}", flush=True)
+
+        c_drive = next((path for path in drives if path.upper().startswith("C:")), None)
+        d_drive = next((path for path in drives if path.upper().startswith("D:")), None)
+
+        checks = {"C盘可见": c_drive is not None, "D盘可见": d_drive is not None}
+
+        if c_drive:
+            checks["切到C盘根"] = panel.set_local_directory(c_drive)
+
+        if d_drive:
+            checks["切到D盘根"] = panel.set_local_directory(d_drive)
+
+        project_root = Path(__file__).resolve().parent.parent
+
+        if project_root.exists():
+            checks["切到项目目录"] = panel.set_local_directory(str(project_root))
+
+        # 面板当前应该停在项目目录
+        checks["当前路径正确"] = Path(panel._local_root_path()) == project_root
+
+        state["local_drives"] = all(checks.values())
+        print("   " + " ".join(f"{name}={value}" for name, value in checks.items()), flush=True)
+
+        panel.grab().save(str(build_dir / "sftp-local-drives.png"))
         finish()
 
     def finish() -> None:
         watchdog.stop()
-        window.close()
+
+        # 退出前确定性收尾（与 main.py 的退出路径一致）
+        window.shutdown()
+
+        from sshmanager.sshclient import close_all_clients
+        from sshmanager.ui.session_tab import drain_sessions
+
+        close_all_clients()
+        drain_sessions(timeout=8)
+
+        alive = [thread.name for thread in threading.enumerate() if thread is not threading.main_thread()]
+        print(f"存活线程：{alive}", flush=True)
+
         app.quit()
 
     QTimer.singleShot(300, step_keys)
@@ -251,7 +342,9 @@ def main() -> int:
     ok = all(state.values())
     print("GUI_EXTRAS_E2E_OK" if ok else "GUI_EXTRAS_E2E_FAILED", flush=True)
 
-    return 0 if ok else 1
+    # 跳过解释器退出阶段（PySide6 6.11 + Python 3.14 退出期可能因 C 层残留线程崩溃）
+    sys.stdout.flush()
+    os._exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

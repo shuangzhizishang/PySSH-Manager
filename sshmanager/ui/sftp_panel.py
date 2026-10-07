@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from PySide6.QtCore import QDir, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QFileSystemModel,
     QHBoxLayout,
     QHeaderView,
@@ -55,6 +57,20 @@ def _remote_entries_from_mime(mime) -> list:
         entries.append(RemoteEntry(name=name, path=path, is_dir=flag == "d"))
 
     return entries
+
+
+class LocalFileModel(QFileSystemModel):
+    """本地文件模型：根指向"此电脑"，从而列出全部盘符。
+
+    Qt 在「此电脑」视图下会把驱动器显示名重复到第二列，这里把驱动器行的
+    第二列置空，避免出现 ``C:  C:`` 这种重复。
+    """
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):  # noqa: N802
+        if role == Qt.ItemDataRole.DisplayRole and index.column() == 1 and not index.parent().isValid():
+            return ""
+
+        return super().data(index, role)
 
 
 class RemoteTable(QTableWidget):
@@ -202,15 +218,45 @@ class SftpPanel(QWidget):
         header.setStyleSheet("font-weight: bold; padding: 2px;")
         column.addWidget(header)
 
-        self.local_model = QFileSystemModel(self)
-        self.local_model.setRootPath(QDir.homePath())
+        path_row = QHBoxLayout()
+
+        self.drive_combo = QComboBox()
+        self.drive_combo.setMinimumWidth(78)
+        self.drive_combo.setToolTip("选择盘符")
+        self.drive_combo.currentIndexChanged.connect(self._on_drive_changed)
+
+        up_button = QPushButton("↑")
+        up_button.setFixedWidth(32)
+        up_button.setToolTip("上级目录")
+        up_button.clicked.connect(self.local_go_up)
+
+        home_button = QPushButton("~")
+        home_button.setFixedWidth(32)
+        home_button.setToolTip("用户主目录")
+        home_button.clicked.connect(self.local_go_home)
+
+        self.local_path_edit = QLineEdit()
+        self.local_path_edit.setPlaceholderText("本地路径")
+        self.local_path_edit.returnPressed.connect(
+            lambda: self.set_local_directory(self.local_path_edit.text())
+        )
+
+        path_row.addWidget(self.drive_combo)
+        path_row.addWidget(up_button)
+        path_row.addWidget(home_button)
+        path_row.addWidget(self.local_path_edit, 1)
+        column.addLayout(path_row)
+
+        self.local_model = LocalFileModel(self)
+        # 根设为"此电脑"（空路径），C: / D: 等所有盘符都会列出来
+        self.local_model.setRootPath("")
         self.local_model.setFilter(
-            QDir.Filter.AllEntries | QDir.Filter.NoDotAndDotDot | QDir.Filter.Hidden
+            QDir.Filter.AllEntries | QDir.Filter.NoDotAndDotDot | QDir.Filter.Hidden | QDir.Filter.Drives
         )
 
         self.local_view = LocalTree(self)
         self.local_view.setModel(self.local_model)
-        self.local_view.setRootIndex(self.local_model.index(QDir.homePath()))
+        self.local_view.setRootIndex(self.local_model.index(""))
         self.local_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.local_view.setAlternatingRowColors(True)
         self.local_view.setSortingEnabled(True)
@@ -218,6 +264,7 @@ class SftpPanel(QWidget):
         self.local_view.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
         self.local_view.setDropIndicatorShown(True)
 
+        # 只保留"名称"列，避免在窄栏里堆列
         for index in range(1, 4):
             self.local_view.setColumnHidden(index, True)
 
@@ -226,7 +273,129 @@ class SftpPanel(QWidget):
 
         column.addWidget(self.local_view, 1)
 
+        self._reload_drives()
+
+        # 首次打开定位到用户主目录（但树根仍是"此电脑"，可以点盘符切走）
+        home = QDir.homePath()
+        self.local_view.setRootIndex(self.local_model.index(home))
+        self.local_path_edit.setText(home)
+        self._sync_drive_selection()
+
         return pane
+
+    # ------------------------------------------------------------------
+    # 本地目录导航（支持盘符）
+    # ------------------------------------------------------------------
+
+    def _reload_drives(self) -> None:
+        """列出本机所有盘符。"""
+
+        drives = []
+
+        for drive in QDir.drives():
+            path = drive.absolutePath()
+
+            if path and path not in drives:
+                drives.append(path)
+
+        if not drives:
+            drives = [QDir.homePath()]
+
+        self.drive_combo.blockSignals(True)
+        self.drive_combo.clear()
+
+        for path in drives:
+            # Windows 上 absolutePath 形如 "C:/"，显示成 "C:"
+            label = path.rstrip("/").rstrip("\\") or path
+            self.drive_combo.addItem(label, path)
+
+        self.drive_combo.blockSignals(False)
+        self._sync_drive_selection()
+
+    def _local_root_path(self) -> str:
+        index = self.local_view.rootIndex()
+
+        return self.local_model.filePath(index) if index.isValid() else ""
+
+    def _sync_drive_selection(self) -> None:
+        """根据当前目录高亮对应盘符。"""
+
+        current = self._local_root_path()
+        index = self.drive_combo.findData(current) if current else -1
+
+        if index < 0 and current:
+            # 当前目录属于某个盘符（例如 C:/Users/…）时选中它的盘
+            for position in range(self.drive_combo.count()):
+                drive = self.drive_combo.itemData(position)
+
+                if drive and current.lower().startswith(str(drive).replace("\\", "/").lower()):
+                    index = position
+                    break
+
+        if index >= 0:
+            self.drive_combo.blockSignals(True)
+            self.drive_combo.setCurrentIndex(index)
+            self.drive_combo.blockSignals(False)
+
+    def _on_drive_changed(self, _index: int) -> None:
+        path = self.drive_combo.currentData()
+
+        if path:
+            self.set_local_directory(path)
+
+    def set_local_directory(self, path: str, update_path_edit: bool = True) -> bool:
+        """把本地面板切到指定目录（支持盘符根、文件路径取父目录）。"""
+
+        raw = (path or "").strip().strip('"')
+
+        if not raw:
+            return False
+
+        if os.path.isfile(raw):
+            raw = os.path.dirname(raw)
+
+        target = Path(raw)
+
+        if not target.exists():
+            self.status.setText(f"✖ 本地目录不存在：{raw}")
+            return False
+
+        index = self.local_model.index(str(target))
+
+        if not index.isValid():
+            self.status.setText(f"✖ 无法读取本地目录：{raw}")
+            return False
+
+        self.local_view.setRootIndex(index)
+
+        if update_path_edit:
+            self.local_path_edit.setText(str(target))
+
+        self._sync_drive_selection()
+
+        return True
+
+    def local_go_up(self) -> None:
+        current = self._local_root_path()
+
+        if not current:
+            return
+
+        parent = str(Path(current).parent)
+
+        if parent and parent != current:
+            self.set_local_directory(parent)
+
+    def local_go_home(self) -> None:
+        self.set_local_directory(QDir.homePath())
+
+    def _open_local_path(self, path: Path) -> None:
+        """双击本地文件时交给系统默认程序打开。"""
+
+        try:
+            os.startfile(str(path))  # noqa: S606 - Windows 打开文件
+        except Exception as error:  # noqa: BLE001
+            self.status.setText(f"✖ 打开失败：{error}")
 
     def _build_remote_pane(self) -> QWidget:
         pane = QWidget()
@@ -458,7 +627,11 @@ class SftpPanel(QWidget):
         path = Path(self.local_model.filePath(index))
 
         if path.is_dir():
-            self.local_view.setRootIndex(self.local_model.index(str(path)))
+            self.set_local_directory(str(path))
+            return
+
+        # 文件：交给系统默认程序打开
+        self._open_local_path(path)
 
     # ==================================================================
     # 操作

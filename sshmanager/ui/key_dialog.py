@@ -313,7 +313,7 @@ class KeyManagerDialog(QDialog):
             self,
             "私钥口令",
             f"请输入 {key.display_name} 的私钥口令：",
-            QInputDialog.EchoMode.Password,
+            QLineEdit.EchoMode.Password,
         )
 
         return text if ok else None
@@ -359,7 +359,7 @@ class KeyManagerDialog(QDialog):
                     self,
                     "部署公钥",
                     f"请输入 {host.target} 的密码：",
-                    QInputDialog.EchoMode.Password,
+                    QLineEdit.EchoMode.Password,
                 )
 
                 if not ok:

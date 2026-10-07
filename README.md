@@ -18,7 +18,12 @@
 - **跳板机**：通过另一台主机建立 direct-tcpip 隧道
 - **本地终端**：应用内嵌 Windows ConPTY 伪终端（PowerShell / cmd），标签里直接跑本机命令
 - **分屏**：左右 / 上下分屏，最多 4 个面板，每个面板是独立的 SSH 会话，分隔条可拖动调整
+- **同一主机多会话**：`Ctrl+Shift+N`（或右键「新会话」）可给一台主机开多条并行会话，
+  标签按 `(1)(2)(3)` 编号，侧边栏主机条目显示 `×N`（开着的会话数）；
+  「连接」在已有会话时只切到该标签，不会重复连接
 - **SFTP 文件管理**：双栏（本地 / 远端）浏览，上传、下载、新建目录、重命名、删除；
+  **本地栏可浏览全部盘符**（C: / D: …：盘符下拉 + 路径框 + 上级/主目录按钮，
+  双击文件用系统默认程序打开）；
   **支持拖拽**（本地文件/目录拖到远端即上传，远端条目拖到本地即下载）与**目录递归传输**，
   传输带进度条与取消；**断点续传**（下载写 `.part` 临时文件，成功后原子替换；
   重试只补缺失字节）
@@ -38,7 +43,8 @@
   规则随主机持久化，可启停并显示状态
 - **主机导入导出**：OpenSSH `~/.ssh/config` 与 JSON 两种格式（JSON 可选带上加密凭据）；
   导入时解析 `ProxyJump` 并自动关联跳板机，别名里的 `-` 前缀会作为分组标签
-- **快捷键**：`Ctrl+N` 新建、`Ctrl+Enter` 连接、`Ctrl+R` 重连、`Ctrl+W` 关标签、
+- **快捷键**：`Ctrl+N` 新建、`Ctrl+Enter` 连接、`Ctrl+Shift+N` 新会话、`Ctrl+R` 重连、
+  `Ctrl+W` 关标签、
   `Ctrl+Shift+F` SFTP、`Ctrl+Shift+P` 端口转发、`Ctrl+Shift+T` 本地终端、
   `Ctrl+Shift+K` 密钥管理、`Ctrl+Shift+R` 开始/停止录制、
   `Ctrl+Shift+E` 左右分屏、`Ctrl+Shift+O` 上下分屏、
@@ -163,7 +169,7 @@ $env:QT_QPA_PLATFORM='offscreen'
 .venv\Scripts\python.exe tests\recording_resume_e2e.py --host 192.168.206.130 --password <密码>
 ```
 
-## 五个已踩过的坑（改动时注意）
+## 七个已踩过的坑（改动时注意）
 
 1. **必须使用 Fusion 样式**：Qt 6.11 在 Windows 上默认用 `windows11` 原生样式，
    该样式会忽略自定义 `QPainter` 的画笔颜色，终端文字会被画成系统默认文字色，
@@ -185,3 +191,13 @@ $env:QT_QPA_PLATFORM='offscreen'
    `SSHClient` 自己建 socket 与 Transport，任何阶段都能可靠打断；
    另外 `paramiko.PKey.from_path()` 传 str 类型 passphrase 会抛
    `TypeError: password must be bytes`，要用 `load_private_key()` 按类型加载。
+6. **先 `socket.shutdown()` 再 `close()`**：Windows 上只关 socket 并不能唤醒另一个
+   线程里阻塞的 `recv`，paramiko 传输层线程会一直挂着。必须先 `shutdown(SHUT_RDWR)`
+   再关闭，最后 `transport.join()` 确认线程退出。
+7. **退出收尾不要只靠 `closeEvent`**：事件循环停止后再 `window.close()` 不会再派发
+   关闭事件，收尾会被整段跳过。因此 `MainWindow.shutdown()` 由代码显式调用
+   （`closeEvent` 与 `main.py` 的退出路径都会走），`main.py` 在 `app.exec()` 之后
+   还会 `close_all_clients()` + `drain_sessions()` 兜底；无法及时 join 的会话线程
+   会登记到模块级列表，避免 QThread 在运行时被回收。测试脚本用 `os._exit()` 报告结论，
+   跳过解释器退出阶段——PySide6 6.11 + Python 3.14 下退出时可能因一个 C 层残留线程
+   触发访问违例，把已经正确的结论变成非零退出码。

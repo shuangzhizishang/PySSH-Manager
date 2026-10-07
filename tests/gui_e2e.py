@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from collections import Counter
 from pathlib import Path
@@ -145,7 +146,7 @@ def main() -> int:
         QTimer.singleShot(200, app.quit)
 
     def attach() -> None:
-        tab = window.tabs.get(host.id)
+        tab = window._session_for(host.id)
 
         if not isinstance(tab, SessionTab):
             QTimer.singleShot(50, attach)
@@ -159,9 +160,15 @@ def main() -> int:
 
     app.exec()
 
-    tab = window.tabs.get(host.id)
+    tab = window._session_for(host.id)
     text = tab.view.emulator.plain_text() if tab else ""
-    window.close()
+    window.shutdown()
+
+    from sshmanager.sshclient import close_all_clients
+    from sshmanager.ui.session_tab import drain_sessions
+
+    close_all_clients()
+    drain_sessions(timeout=8)
 
     print("--- 终端末尾 ---", flush=True)
 
@@ -171,7 +178,9 @@ def main() -> int:
     ok = state["done"]
     print("E2E_OK" if ok else "E2E_FAILED", flush=True)
 
-    return 0 if ok else 1
+    # 跳过解释器退出阶段（PySide6 6.11 + Python 3.14 退出期可能因 C 层残留线程崩溃）
+    sys.stdout.flush()
+    os._exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

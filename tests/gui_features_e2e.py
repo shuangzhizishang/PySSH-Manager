@@ -139,9 +139,13 @@ def main() -> int:
 
     def step_split() -> None:
         window.split_current(Qt.Orientation.Horizontal)
-        split = window.tabs.get(host.id)
+        # window.tabs 现在是「主机 id → 标签列表」，分屏后该主机的标签变成 SplitTerminalTab
+        split = next(
+            (tab for tab in window._tabs_for_host(host.id) if isinstance(tab, SplitTerminalTab)),
+            None,
+        )
 
-        if not isinstance(split, SplitTerminalTab):
+        if split is None:
             print("分屏标签未创建", flush=True)
             app.quit()
             return
@@ -170,7 +174,10 @@ def main() -> int:
         QTimer.singleShot(400, poll)
 
     def capture_and_next() -> None:
-        split = window.tabs.get(host.id)
+        split = next(
+            (tab for tab in window._tabs_for_host(host.id) if isinstance(tab, SplitTerminalTab)),
+            None,
+        )
         panes = split.panes if isinstance(split, SplitTerminalTab) else []
 
         a_ok = any("PANE-A" in pane.view.emulator.plain_text() for pane in panes)
@@ -253,7 +260,13 @@ def main() -> int:
 
     def finish() -> None:
         watchdog.stop()
-        window.close()
+        window.shutdown()
+
+        from sshmanager.sshclient import close_all_clients
+        from sshmanager.ui.session_tab import drain_sessions
+
+        close_all_clients()
+        drain_sessions(timeout=8)
         app.quit()
 
     QTimer.singleShot(300, step_local)
@@ -267,7 +280,9 @@ def main() -> int:
     ok = all(state.values())
     print("GUI_FEATURES_E2E_OK" if ok else "GUI_FEATURES_E2E_FAILED", flush=True)
 
-    return 0 if ok else 1
+    # 跳过解释器退出阶段（PySide6 6.11 + Python 3.14 退出期可能因 C 层残留线程崩溃）
+    sys.stdout.flush()
+    os._exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

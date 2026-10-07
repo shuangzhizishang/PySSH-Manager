@@ -11,6 +11,7 @@ from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
     QInputDialog,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -73,7 +74,7 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
 
         self.context = context
-        self.tabs: dict[str, SessionTab | SplitTerminalTab] = {}
+        self.tabs: dict[str, list] = {}  # 主机 id → 该主机的终端标签列表（支持多会话）
         self.sftp_tabs: dict[str, SftpPanel] = {}
         self.local_tabs: dict[str, LocalTerminalTab] = {}
         self.replay_dialog = None
@@ -109,6 +110,10 @@ class MainWindow(QMainWindow):
         self.action_connect = QAction("连接", self)
         self.action_connect.setShortcut(QKeySequence("Ctrl+Return"))
         self.action_connect.triggered.connect(self.connect_selected)
+
+        self.action_new_session = QAction("新会话", self)
+        self.action_new_session.setShortcut(QKeySequence("Ctrl+Shift+N"))
+        self.action_new_session.triggered.connect(self.new_session_for_selected)
 
         self.action_reconnect = QAction("重新连接", self)
         self.action_reconnect.setShortcut(QKeySequence("Ctrl+R"))
@@ -181,6 +186,7 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar("主工具栏")
         toolbar.setMovable(False)
         toolbar.addAction(self.action_connect)
+        toolbar.addAction(self.action_new_session)
         toolbar.addAction(self.action_reconnect)
         toolbar.addSeparator()
         toolbar.addAction(self.action_sftp)
@@ -198,6 +204,7 @@ class MainWindow(QMainWindow):
 
         menu = self.menuBar().addMenu("会话")
         menu.addAction(self.action_connect)
+        menu.addAction(self.action_new_session)
         menu.addAction(self.action_reconnect)
         menu.addSeparator()
         menu.addAction(self.action_sftp)
@@ -284,7 +291,10 @@ class MainWindow(QMainWindow):
                 self.host_list.addItem(header)
 
             for host in grouped[group]:
-                item = QListWidgetItem(f"{host.display_name}\n{host.target}")
+                # 已开会话时在条目上标出数量和序号
+                open_count = len(self._tabs_for_host(host.id))
+                badge = f"  ×{open_count}" if open_count else ""
+                item = QListWidgetItem(f"{host.display_name}{badge}\n{host.target}")
                 item.setData(STATE_ROLE, host.id)
                 tooltip = f"{host.username}@{host.hostname}:{host.port}"
 
@@ -338,6 +348,7 @@ class MainWindow(QMainWindow):
         single = len(hosts) == 1
 
         menu.addAction("连接", self.connect_selected)
+        menu.addAction("新会话（同一主机多条）", self.new_session_for_selected).setEnabled(single)
         menu.addAction(f"连接选中的 {len(hosts)} 台", self.connect_selected_hosts)
         menu.addSeparator()
         menu.addAction("编辑主机", self.edit_host).setEnabled(single)
@@ -455,10 +466,31 @@ class MainWindow(QMainWindow):
 
         self.connect_host(host)
 
-    def connect_host(self, host: Host) -> None:
-        if host.id in self.tabs:
-            self.tabs_widget.setCurrentWidget(self.tabs[host.id])
+    def new_session_for_selected(self) -> None:
+        """为选中主机再开一个会话（同一主机可以有多条并行会话）。"""
+
+        host = self._selected_host()
+
+        if host is None:
+            QMessageBox.information(self, APP_NAME, "请先在左侧选择一台主机。")
             return
+
+        self.connect_host(host, force_new=True)
+
+    def connect_host(self, host: Host, force_new: bool = False) -> None:
+        """连接主机。
+
+        默认复用已有的第一个会话（把标签切到前台）；``force_new=True``
+        时无论是否已有会话都再开一条新会话。
+        """
+
+        if not force_new:
+            existing = self._first_tab_for_host(host.id)
+
+            if existing is not None:
+                self.tabs_widget.setCurrentWidget(existing)
+                self.statusBar().showMessage(f"{host.display_name} 已有会话，已切到该标签（要再开一条请用「新会话」）")
+                return
 
         credential = self._ensure_credential(host)
 
@@ -476,27 +508,135 @@ class MainWindow(QMainWindow):
         self.tabs_widget.setTabToolTip(index, host.target)
         self.tabs_widget.setCurrentIndex(index)
 
-        self.tabs[host.id] = tab
+        self._tabs_for_host(host.id).append(tab)
+        self._refresh_tab_title(host)
         self.context.hosts.mark_connected(host.id)
+        self.refresh_hosts()
         self._update_window_title()
 
+    # ------------------------------------------------------------------
+    # 同一主机多会话的辅助
+    # ------------------------------------------------------------------
+
+    def _tabs_for_host(self, host_id: str) -> list:
+        """该主机当前打开的所有终端标签（普通会话 / 分屏）。"""
+
+        return [
+            self.tabs_widget.widget(row)
+            for row in range(self.tabs_widget.count())
+            if getattr(self.tabs_widget.widget(row), "host", None) is not None
+            and self.tabs_widget.widget(row).host.id == host_id
+            and isinstance(self.tabs_widget.widget(row), (SessionTab, SplitTerminalTab))
+        ]
+
+    def _first_tab_for_host(self, host_id: str):
+        tabs = self._tabs_for_host(host_id)
+
+        return tabs[0] if tabs else None
+
+    def _session_count(self, host: Host) -> int:
+        """该主机的终端面板总数（分屏按面板数计）。"""
+
+        count = 0
+
+        for widget in self._tabs_for_host(host.id):
+            if isinstance(widget, SplitTerminalTab):
+                count += max(1, len(widget.panes))
+            else:
+                count += 1
+
+        return count
+
+    def _pane_ordinal(self, pane) -> int:
+        """该面板在同主机所有面板里的序号（从 1 开始）。"""
+
+        host = getattr(pane, "host", None)
+
+        if host is None:
+            return 0
+
+        ordinal = 0
+
+        for widget in self._tabs_for_host(host.id):
+            if isinstance(widget, SplitTerminalTab):
+                for candidate in widget.panes:
+                    ordinal += 1
+
+                    if candidate is pane:
+                        return ordinal
+            else:
+                ordinal += 1
+
+                if widget is pane:
+                    return ordinal
+
+        return ordinal
+
+    def _refresh_tab_title(self, host: Host) -> None:
+        """按会话数量更新标签标题：1 条不加后缀，多条显示 (2)(3)…"""
+
+        tabs = self._tabs_for_host(host.id)
+
+        if not tabs:
+            return
+
+        ordinal = 0
+
+        for widget in tabs:
+            index = self.tabs_widget.indexOf(widget)
+
+            if index < 0:
+                continue
+
+            if isinstance(widget, SplitTerminalTab):
+                for pane in widget.panes:
+                    ordinal += 1
+                    title = self._titled(widget, pane, ordinal, len(tabs))
+                    # 分屏容器只有一个标签，标题用整个容器的
+                    self.tabs_widget.setTabText(index, title)
+                    break
+
+                ordinal += max(0, len(widget.panes) - 1)
+            else:
+                ordinal += 1
+                self.tabs_widget.setTabText(index, self._titled(widget, widget, ordinal, len(tabs)))
+
+    @staticmethod
+    def _titled(widget, pane, ordinal: int, tab_count: int) -> str:
+        name = getattr(widget, "display_name", "") or "会话"
+
+        if tab_count <= 1:
+            return name[:40] if widget is pane else f"{name} ({ordinal})"
+
+        return f"{name} ({ordinal})"[:40]
+
     def _session_for(self, host_id: str) -> SessionTab | None:
-        """取该主机当前的终端面板（分屏时取焦点所在的那个）。"""
+        """取该主机当前的终端面板（优先焦点标签，兼容分屏）。"""
 
-        widget = self.tabs.get(host_id)
+        current = self.tabs_widget.currentWidget()
 
-        if isinstance(widget, SplitTerminalTab):
-            return widget.active_pane()
+        if isinstance(current, SplitTerminalTab) and current.host.id == host_id:
+            return current.active_pane()
 
-        if isinstance(widget, SessionTab):
-            return widget
+        if isinstance(current, SessionTab) and current.host.id == host_id:
+            return current
 
-        return None
+        first = self._first_tab_for_host(host_id)
+
+        if isinstance(first, SplitTerminalTab):
+            return first.active_pane()
+
+        return first if isinstance(first, SessionTab) else None
 
     def _iter_terminal_tabs(self) -> list:
         """所有终端类标签（普通会话、分屏、本地终端）。"""
 
-        return [*self.tabs.values(), *self.local_tabs.values()]
+        return [*self._all_host_tabs(), *self.local_tabs.values()]
+
+    def _all_host_tabs(self) -> list:
+        """所有主机终端标签（同一主机可能有多条）。"""
+
+        return [tab for tabs in self.tabs.values() for tab in tabs]
 
     def _ensure_credential(self, host: Host) -> str | None:
         """取主机凭据；密码认证且没有保存过时，向用户询问一次并加密保存。"""
@@ -510,7 +650,7 @@ class MainWindow(QMainWindow):
             self,
             APP_NAME,
             f"请输入 {host.target} 的密码（将加密保存到本机）：",
-            QInputDialog.EchoMode.Normal,
+            QLineEdit.EchoMode.Normal,
         )
 
         if not ok:
@@ -585,13 +725,15 @@ class MainWindow(QMainWindow):
 
         clients = {host_id: client for host_id, client in self.context.jump_clients.items() if client.is_connected()}
 
-        for host_id, tab in self.tabs.items():
-            pane = tab.active_pane() if isinstance(tab, SplitTerminalTab) else tab
-            session = getattr(pane, "session", None)
-            client = getattr(session, "client", None)
+        for host_id, tabs in self.tabs.items():
+            for tab in tabs:
+                pane = tab.active_pane() if isinstance(tab, SplitTerminalTab) else tab
+                session = getattr(pane, "session", None)
+                client = getattr(session, "client", None)
 
-            if client is not None and client.is_connected():
-                clients[host_id] = client
+                if client is not None and client.is_connected():
+                    clients[host_id] = client
+                    break
 
         return clients
 
@@ -741,7 +883,7 @@ class MainWindow(QMainWindow):
                         self,
                         "导入 PuTTY 密钥",
                         f"{path.name} 已加密，请输入 passphrase：",
-                        QInputDialog.EchoMode.Password,
+                        QLineEdit.EchoMode.Password,
                     )
 
                     if not ok:
@@ -818,17 +960,14 @@ class MainWindow(QMainWindow):
         hosts = self._selected_hosts()
         closed = 0
 
+        # 关闭选中主机的全部会话（含分屏与多开）
         for host in hosts:
-            tab = self.tabs.get(host.id)
+            for tab in list(self._tabs_for_host(host.id)):
+                index = self.tabs_widget.indexOf(tab)
 
-            if tab is None:
-                continue
-
-            index = self.tabs_widget.indexOf(tab)
-
-            if index >= 0:
-                self.close_tab(index)
-                closed += 1
+                if index >= 0:
+                    self.close_tab(index)
+                    closed += 1
 
         self.statusBar().showMessage(f"已断开 {closed} 台主机的会话")
 
@@ -913,8 +1052,19 @@ class MainWindow(QMainWindow):
         self.tabs_widget.setTabToolTip(new_index, host.target)
         self.tabs_widget.setCurrentIndex(new_index)
 
-        self.tabs[host.id] = split
+        # 同一个 SessionTab 被装进分屏容器：把它在列表里替换掉
+        tabs = self._tabs_for_host(host.id)
+
+        for position, candidate in enumerate(tabs):
+            if candidate is widget:
+                tabs[position] = split
+                break
+        else:
+            tabs.append(split)
+
+        self.tabs[host.id] = tabs
         split.add_pane(activate=True)
+        self._refresh_tab_title(host)
         self._update_window_title()
 
     def focus_next_pane(self) -> None:
@@ -1099,7 +1249,7 @@ class MainWindow(QMainWindow):
         host.verify_host_key = False
         self.context.hosts.update(host)
 
-        tab = self.tabs.get(host.id)
+        tab = self._first_tab_for_host(host.id)
 
         if isinstance(tab, SplitTerminalTab):
             tab.reconnect_all()
@@ -1107,15 +1257,43 @@ class MainWindow(QMainWindow):
             tab.reconnect()
 
     def _on_title(self, host: Host, title: str) -> None:
-        tab = self.tabs.get(host.id)
+        """远端 OSC 改了标题：把它作为该主机所有标签的标题基础。"""
 
-        if tab is None:
+        if not title:
             return
 
-        index = self.tabs_widget.indexOf(tab)
+        for tab in self._tabs_for_host(host.id):
+            tab.remote_title = title[:40]
 
-        if index >= 0 and title:
-            self.tabs_widget.setTabText(index, title[:40])
+        self._refresh_tab_title_by_title(host)
+        self._update_window_title()
+
+    def _refresh_tab_title_by_title(self, host: Host) -> None:
+        """按"远端标题优先"的规则刷新标签文字，并保留多会话序号。"""
+
+        tabs = self._tabs_for_host(host.id)
+
+        if not tabs:
+            return
+
+        base = getattr(tabs[0], "remote_title", "") or (host.display_name)
+        ordinal = 0
+
+        for widget in tabs:
+            index = self.tabs_widget.indexOf(widget)
+
+            if index < 0:
+                continue
+
+            if isinstance(widget, SplitTerminalTab):
+                ordinal += 1
+                text = base if len(tabs) <= 1 and ordinal == 1 else f"{base} ({ordinal})"
+                self.tabs_widget.setTabText(index, text[:40])
+                ordinal += max(0, len(widget.panes) - 1)
+            else:
+                ordinal += 1
+                text = base if len(tabs) <= 1 else f"{base} ({ordinal})"
+                self.tabs_widget.setTabText(index, text[:40])
 
     def _on_session_finished(self, host: Host) -> None:
         if self._quitting:
@@ -1165,12 +1343,21 @@ class MainWindow(QMainWindow):
             widget.close()
             self.tabs_widget.removeTab(index)
 
-            if self.tabs.get(host.id) is widget:
-                del self.tabs[host.id]
+            tabs = self._tabs_for_host(host.id)
+
+            # 注意：removeTab 之后该控件已不在 tabs_widget 里，所以按对象比对
+            remaining = [tab for tab in tabs if tab is not widget]
+
+            if remaining:
+                self.tabs[host.id] = remaining
+                self._refresh_tab_title(host)
+            else:
+                self.tabs.pop(host.id, None)
         else:
             return
 
         self._update_window_title()
+        self.refresh_hosts()
 
     def reconnect_current(self) -> None:
         widget = self.tabs_widget.currentWidget()
@@ -1238,23 +1425,68 @@ class MainWindow(QMainWindow):
         else:
             self.setWindowTitle(f"{APP_NAME} {__version__}")
 
-    def closeEvent(self, event):  # noqa: N802
+    def shutdown(self) -> None:
+        """确定性地停掉所有会话、面板与连接。
+
+        不依赖事件循环：``closeEvent`` 只有在事件循环还在跑时才会被处理，
+        测试或 ``app.quit()`` 之后再 ``window.close()`` 就可能整个跳过收尾，
+        导致 paramiko 传输层线程残留到进程退出阶段（access violation）。
+        """
+
         self._quitting = True
 
-        for tab in list(self.tabs.values()):
-            tab.close()
+        # 先让所有会话线程停下来（各自会关掉自己的 SSHClient）
+        for tab in self._all_host_tabs():
+            try:
+                tab.close()
+            except Exception:
+                pass
 
         for tab in list(self.local_tabs.values()):
-            tab.close()
+            try:
+                tab.close()
+            except Exception:
+                pass
 
         for panel in list(self.sftp_tabs.values()):
-            panel.close()
+            try:
+                panel.close()
+            except Exception:
+                pass
 
+        # 兜底：再扫一遍所有 client，确保 socket/传输层都被关闭并 join
+        for tab in self._all_host_tabs():
+            panes = tab.panes if hasattr(tab, "panes") else [tab]
+
+            for pane in panes:
+                session = getattr(pane, "session", None)
+                client = getattr(session, "client", None)
+
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+
+        for panel in list(self.sftp_tabs.values()):
+            worker = getattr(panel, "worker", None)
+
+            if worker is not None:
+                client = getattr(worker, "client", None)
+
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+
+        self.context.close()
         self.tabs.clear()
         self.local_tabs.clear()
         self.sftp_tabs.clear()
-        self.context.close()
 
+    def closeEvent(self, event):  # noqa: N802
+        self.shutdown()
         event.accept()
 
 

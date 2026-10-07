@@ -122,8 +122,8 @@ def main() -> int:
     # 2) 端口转发对话框
     # ------------------------------------------------------------------
     def open_forward_dialog() -> None:
-        session = window.tabs.get(host.id)
-        existing = session.session.client if session is not None else None
+        session = window._session_for(host.id)
+        existing = session.session.client if session is not None and session.session is not None else None
 
         dialog = ForwardDialog(
             host,

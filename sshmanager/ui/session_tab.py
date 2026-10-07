@@ -20,6 +20,10 @@ from ..terminal.view import TerminalView
 
 LOCAL_ID = "local"
 
+#: 无法在限定时间内 join 的会话线程。保留引用可避免 QThread 对象在仍运行时被
+#: 垃圾回收（Qt 会打印 "QThread: Destroyed while thread is still running" 并可能崩溃）。
+_ORPHANED_SESSIONS: list = []
+
 
 def make_local_host(shell_command: str | None = None) -> Host:
     """造一个代表本地终端的主机对象（仅用于界面归类，不持久化）。"""
@@ -32,6 +36,27 @@ def make_local_host(shell_command: str | None = None) -> Host:
         auth_type="local",
         verify_host_key=False,
     )
+
+
+def drain_sessions(timeout: float = 5.0) -> int:
+    """等待仍在运行的会话线程结束，返回未结束的数量。
+
+    ``_ORPHANED_SESSIONS`` 里的线程是在"连接中途关窗"等场景下没能及时 join 的，
+    退出前再等一次；只要底层连接已关闭，它们通常很快结束。
+    """
+
+    remaining = 0
+
+    for session in list(_ORPHANED_SESSIONS):
+        try:
+            if session.wait(int(timeout * 1000)):
+                _ORPHANED_SESSIONS.remove(session)
+            else:
+                remaining += 1
+        except Exception:
+            remaining += 1
+
+    return remaining
 
 
 class TerminalTab(QWidget):
@@ -62,6 +87,8 @@ class TerminalTab(QWidget):
         self._closing = False
         self.status_hint = "○ 正在连接..."
         self.recorder = None
+        #: 远端通过 OSC 序列设置的标题（优先用于标签名）
+        self.remote_title = ""
 
         self.view = TerminalView()
         self.view.data_to_send.connect(self._on_input)
@@ -86,6 +113,9 @@ class TerminalTab(QWidget):
 
     @property
     def display_name(self) -> str:
+        if self.remote_title:
+            return self.remote_title
+
         if self.host is not None:
             return self.host.display_name
 
@@ -174,9 +204,22 @@ class TerminalTab(QWidget):
         else:
             self.session.request_stop()
 
+        if self.session.wait(5000):
+            return
+
+        # 还在跑（常见于"连接/认证中途关窗"）：再断一次并等，最后把对象留在
+        # 模块级列表里，避免 QThread 在运行中被销毁
+        self.session.request_stop()
+        client = getattr(self.session, "client", None)
+
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
         if not self.session.wait(3000):
-            self.session.terminate()
-            self.session.wait(500)
+            _ORPHANED_SESSIONS.append(self.session)
 
     # ------------------------------------------------------------------
 
