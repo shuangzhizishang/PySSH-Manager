@@ -17,16 +17,14 @@ import os
 import sys
 
 # ==============================
-# 默认连接目标（等价于旧版硬编码，只用于首次导入）
+# 命令行默认值
 # ==============================
 
-DEFAULT_HOST = "192.168.206.130"
+#: 默认不连接任何主机：启动后显示主机列表，由用户自己添加/选择。
+#: 想启动即连接可以传 ``--host``（见 --help）。
+DEFAULT_HOST = ""
 DEFAULT_PORT = 22
 DEFAULT_USERNAME = "root"
-
-#: 仅当凭据库中还没有该主机密码时使用一次，随后即加密入库；
-#: 想彻底移除可在 PyCharm 里删掉这一行并重新运行。
-LEGACY_PASSWORD = "123456"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -118,9 +116,6 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.password:
             context.credentials.set(host.id, args.password)
-        elif not context.credentials.get(host.id) and LEGACY_PASSWORD:
-            # 首次运行：把旧版写死在代码里的密码加密存起来
-            context.credentials.set(host.id, LEGACY_PASSWORD)
 
         target_id = host.id
         window.refresh_hosts()

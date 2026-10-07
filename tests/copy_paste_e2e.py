@@ -10,7 +10,7 @@
 
 运行::
 
-    .venv\\Scripts\\python.exe tests\\copy_paste_e2e.py --host 192.168.206.130 --password 123456
+    .venv\\Scripts\\python.exe tests\\copy_paste_e2e.py --host <你的服务器> --password <密码>
 """
 
 from __future__ import annotations

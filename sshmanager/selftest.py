@@ -13,7 +13,7 @@
 用法::
 
     PySSH-Manager.exe --selftest %TEMP%\\pyssh-selftest.json
-    PySSH-Manager.exe --selftest report.json --host 192.168.206.130 --username root --password 123456
+    PySSH-Manager.exe --selftest report.json --host <你的服务器> --username root --password <密码>
 """
 
 from __future__ import annotations

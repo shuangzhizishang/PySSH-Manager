@@ -15,7 +15,7 @@
 
 运行::
 
-    .venv\\Scripts\\python.exe tests\\command_features_e2e.py --host 192.168.206.130 --password 123456
+    .venv\\Scripts\\python.exe tests\\command_features_e2e.py --host <你的服务器> --password <密码>
 """
 
 from __future__ import annotations
