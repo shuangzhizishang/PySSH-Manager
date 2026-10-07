@@ -1,10 +1,12 @@
-"""命令功能的真实链路验证：输入栏发送、输出回拷、另存、剪切、命令库。
+"""命令功能的真实链路验证：直接输入 / 粘贴、命令库、输出回拷、终端剪切。
+
+不做命令输入栏——Windows→Linux 就是**直接在终端里打字或粘贴**。
 
 覆盖：
-1. 命令输入栏发送（Windows→Linux）并在终端看到输出
-2. 多行命令逐行执行
-3. 发送过的命令进入历史
-4. 收藏命令，并从命令库再发送
+1. 直接在终端里键入命令（Windows→Linux，键盘输入）
+2. Ctrl+Shift+V 把 Windows 剪贴板粘贴到远端（多行一次贴）
+3. 命令库发送命令并记入历史
+4. 收藏终端选中内容为命令
 5. 复制全部输出到 Windows 剪贴板（Linux→Windows）
 6. 输出另存为文件
 7. 终端选中后「剪切」：复制到剪贴板并清空选区
@@ -28,8 +30,9 @@ from pathlib import Path
 os.environ.setdefault("PYSSH_DATA_DIR", tempfile.mkdtemp(prefix="pyssh-cmd-"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from sshmanager.commands import MODE_COPY, MODE_CUT, get_store, reset_store
@@ -38,7 +41,8 @@ from sshmanager.hosts import Host, HostStore
 from sshmanager.ui import AppContext, MainWindow
 from sshmanager.ui.command_library import CommandLibraryDialog
 
-MARKER = "PSSH-COMMAND-BAR-OK"
+MARKER = "PSSH-DIRECT-OK"
+PASTE_MARKER = "PSSH-PASTE-OK"
 
 
 def main() -> int:
@@ -47,7 +51,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=22)
     parser.add_argument("--username", default="root")
     parser.add_argument("--password", default="")
-    parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--timeout", type=float, default=180.0)
     args = parser.parse_args()
 
     app = QApplication(sys.argv[:1])
@@ -71,10 +75,10 @@ def main() -> int:
     window.show()
 
     state = {
-        "send_from_bar": False,
-        "multiline": False,
-        "history_recorded": False,
-        "favorite_and_send": False,
+        "type_directly": False,
+        "paste_from_windows": False,
+        "library_send_and_history": False,
+        "favorite_selection": False,
         "copy_output_to_windows": False,
         "save_output": False,
         "terminal_cut": False,
@@ -89,6 +93,7 @@ def main() -> int:
     watchdog.start(int(args.timeout * 1000))
 
     pane = None
+    build_dir = Path(__file__).resolve().parent.parent / "build"
     output_file = Path(tempfile.mkdtemp(prefix="pyssh-cmd-out-")) / "output.txt"
 
     def wait_for(predicate, timeout: float = 25.0, interval: float = 200) -> bool:
@@ -128,128 +133,137 @@ def main() -> int:
                 return
 
             pane = session
-            prompt_seen = wait_for(
+            ready = wait_for(
                 lambda: any(marker in terminal_text() for marker in ("#", "$", ">")) and len(terminal_text()) > 3,
                 timeout=30,
             )
 
-            if not prompt_seen:
+            if not ready:
                 print("没有看到 shell 提示符", flush=True)
                 app.quit()
                 return
 
-            print("SSH 会话已就绪，命令输入栏可见 =", pane.command_bar_visible, flush=True)
-            QTimer.singleShot(300, step_send_from_bar)
+            print("SSH 会话已就绪（无命令输入栏，直接操作终端）", flush=True)
+            QTimer.singleShot(300, step_type_directly)
 
         QTimer.singleShot(500, poll)
 
     # ------------------------------------------------------------------
-    # 1) 输入栏发送
+    # 1) 直接键入
     # ------------------------------------------------------------------
-    def step_send_from_bar() -> None:
-        pane.command_bar.set_text(f"echo {MARKER}")
+    def step_type_directly() -> None:
+        pane.view.setFocus()
         app.processEvents()
-        pane.command_bar.send_button.click()
+
+        QTest.keyClicks(pane.view, f"echo {MARKER}")
+        QTest.keyClick(pane.view, Qt.Key.Key_Return)
 
         ok = wait_for(lambda: MARKER in terminal_text())
-        state["send_from_bar"] = ok
-        print(f"1. 命令输入栏发送（Windows→Linux）：输出可见={ok}", flush=True)
+        state["type_directly"] = ok
+        print(f"1. 直接在终端键入命令（Windows→Linux）：输出可见={ok}", flush=True)
 
-        QTimer.singleShot(200, step_multiline)
+        QTimer.singleShot(200, step_paste_from_windows)
 
     # ------------------------------------------------------------------
-    # 2) 多行命令
+    # 2) 从 Windows 剪贴板粘贴到远端
     # ------------------------------------------------------------------
-    def step_multiline() -> None:
-        pane.command_bar.set_text("echo PSSH-LINE-1\necho PSSH-LINE-2")
+    def step_paste_from_windows() -> None:
+        QGuiApplication.clipboard().setText(f"echo {PASTE_MARKER}\necho PSSH-PASTE-LINE-2")
+        pane.view.setFocus()
         app.processEvents()
-        pane.command_bar.send_button.click()
 
-        ok = wait_for(
-            lambda: "PSSH-LINE-1" in terminal_text() and "PSSH-LINE-2" in terminal_text()
-        )
-        state["multiline"] = ok
-        print(f"2. 多行命令逐行执行：两行都出现={ok}", flush=True)
+        # Ctrl+Shift+V：把 Windows 剪贴板内容发到远端
+        QTest.keyClick(pane.view, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
 
-        QTimer.singleShot(200, step_history)
+        ok = wait_for(lambda: PASTE_MARKER in terminal_text() and "PSSH-PASTE-LINE-2" in terminal_text())
+        state["paste_from_windows"] = ok
+        print(f"2. 粘贴 Windows 剪贴板到 Linux（多行）：两行都出现={ok}", flush=True)
 
-    # ------------------------------------------------------------------
-    # 3) 历史
-    # ------------------------------------------------------------------
-    def step_history() -> None:
-        store = get_store()
-        entries = store.history_for(host.id)
-        recorded = any(MARKER in entry.text for entry in entries) and len(entries) >= 2
-
-        state["history_recorded"] = recorded
-        print(f"3. 命令历史：共 {len(entries)} 条，包含刚才的命令={recorded}", flush=True)
-
-        QTimer.singleShot(200, step_favorite)
+        QTimer.singleShot(200, step_history_and_library)
 
     # ------------------------------------------------------------------
-    # 4) 收藏 + 从命令库发送
+    # 3) 命令库发送 + 历史
     # ------------------------------------------------------------------
-    def step_favorite() -> None:
+    def step_history_and_library() -> None:
         store = get_store()
         command = "echo PSSH-FROM-LIBRARY"
-        pane.command_bar.set_text(command)
+
+        # 直接调用与命令库相同的发送入口（记历史）
+        pane.send_command(command)
+
+        history_ok = wait_for(lambda: any(command in entry.text for entry in store.history_for(host.id))) and bool(
+            store.history_for(host.id)
+        )
+        output_ok = wait_for(lambda: "PSSH-FROM-LIBRARY" in terminal_text())
+
+        state["library_send_and_history"] = history_ok and output_ok
+        print(
+            f"3. 命令库发送 + 历史：历史 {len(store.history_for(host.id))} 条={history_ok}，输出={output_ok}",
+            flush=True,
+        )
+
+        QTimer.singleShot(200, step_favorite_selection)
+
+    # ------------------------------------------------------------------
+    # 4) 收藏选中内容
+    # ------------------------------------------------------------------
+    def step_favorite_selection() -> None:
+        # 选中包含刚才那条命令的若干行
+        pane.view._anchor = (0, 0)
+        pane.view._cursor_cell = (pane.view.emulator.lines - 1, 0)
         app.processEvents()
-        pane.favorite_command(command)
 
-        snippet = next((item for item in store.snippets if item.text == command), None)
+        selected = pane.view.selected_text()
+        pane.view.select_to_copy = False  # 避免选中即复制干扰
+        window.favorite_selection()
 
-        if snippet is None:
-            print("收藏失败", flush=True)
-            app.quit()
-            return
+        store = get_store()
+        stored = [item.text for item in store.snippets]
+        ok = bool(selected.strip()) and any("PSSH" in text for text in stored)
+
+        state["favorite_selection"] = ok
+        print(f"4. 收藏选中内容：选中 {len(selected)} 字符，命令库现有 {len(stored)} 条={ok}", flush=True)
+
+        pane.view.clear_selection()
+        QTimer.singleShot(200, step_library_dialog)
+
+    # ------------------------------------------------------------------
+    # 5) 命令库对话框：发送 + 条目复制/剪切/粘贴/撤销
+    # ------------------------------------------------------------------
+    def step_library_dialog() -> None:
+        store = get_store()
+        store.add("echo PSSH-SNIPPET-A", group="e2e", host_id=host.id)
+        snippet = store.add("echo PSSH-SNIPPET-B", group="e2e", host_id=host.id)
 
         dialog = CommandLibraryDialog(store, host_id=host.id, host_label=host.label, parent=window)
         dialog.send_requested.connect(pane.send_command)
         dialog.show()
         app.processEvents()
+        dialog.grab().save(str(build_dir / "command-library.png"))
 
-        # 选中刚收藏的那条并发送
-        for row in range(dialog.table.rowCount()):
-            if dialog.table.item(row, 0).data(0x0100) == snippet.id:  # UserRole
-                dialog.table.selectRow(row)
-                break
+        dialog.select_ids([snippet.id])
+        sent_ok = False
 
-        app.processEvents()
-        dialog.send_selected()
-        app.processEvents()
-        dialog.grab().save(str(Path(__file__).resolve().parent.parent / "build" / "command-library.png"))
+        if dialog.selected_snippet_ids():
+            dialog.send_selected()
+            app.processEvents()
+            sent_ok = wait_for(lambda: "PSSH-SNIPPET-B" in terminal_text())
+        else:
+            print("命令库里没能选中条目", flush=True)
 
-        ok = wait_for(lambda: "PSSH-FROM-LIBRARY" in terminal_text())
-
-        build_dir = Path(__file__).resolve().parent.parent / "build"
-        build_dir.mkdir(parents=True, exist_ok=True)
-        window.grab().save(str(build_dir / "command-bar.png"))
-
-        # 命令库条目操作：复制 → 粘贴到新分组 → 撤销
+        # 条目复制 → 粘贴到新分组 → 撤销；再剪切 → 粘贴 → 撤销
         before = len(store.snippets)
-        dialog.table.selectRow(
-            next(
-                (
-                    row
-                    for row in range(dialog.table.rowCount())
-                    if dialog.table.item(row, 0).data(0x0100) == snippet.id
-                ),
-                0,
-            )
-        )
-        app.processEvents()
+        dialog.select_ids([snippet.id])
         dialog.copy_selection(MODE_COPY)
-        dialog.paste_target.setCurrentText("e2e-分组")
+        dialog.paste_target.setCurrentText("e2e-复制组")
         dialog.paste_clipboard()
         after_paste = len(store.snippets)
         dialog.undo()
         after_undo = len(store.snippets)
 
-        clipboard_ok = after_paste == before + 1 and after_undo == before
+        copy_ok = after_paste == before + 1 and after_undo == before
 
-        # 剪切：移动分组后再撤销
-        dialog.table.selectRow(0)
-        app.processEvents()
+        dialog.select_ids([store.snippets[0].id])
         dialog.copy_selection(MODE_CUT)
         dialog.paste_target.setCurrentText("e2e-剪切组")
         dialog.paste_clipboard()
@@ -257,11 +271,10 @@ def main() -> int:
         dialog.undo()
         restored = not any(item.group == "e2e-剪切组" for item in store.snippets)
 
-        state["favorite_and_send"] = ok
-        state["snippet_clipboard_undo"] = clipboard_ok and moved and restored
-        print(f"4. 收藏并从命令库发送：输出可见={ok}", flush=True)
+        state["library_send_and_history"] = state["library_send_and_history"] and sent_ok
+        state["snippet_clipboard_undo"] = copy_ok and moved and restored
         print(
-            f"   条目复制/粘贴/撤销：粘贴后 {after_paste} → 撤销后 {after_undo}（原 {before}）；"
+            f"5. 命令库：发送={sent_ok}；复制粘贴撤销 {before}→{after_paste}→{after_undo}；"
             f"剪切移动={moved}，撤销还原={restored}",
             flush=True,
         )
@@ -270,24 +283,23 @@ def main() -> int:
         QTimer.singleShot(200, step_copy_output)
 
     # ------------------------------------------------------------------
-    # 5) 复制全部输出到 Windows
+    # 6) 复制全部输出到 Windows
     # ------------------------------------------------------------------
     def step_copy_output() -> None:
-        text = pane.view.copy_all_output()
+        text = pane.copy_output()
         clipboard = QGuiApplication.clipboard().text()
-        ok = MARKER in text and MARKER in clipboard and "PSSH-LINE-2" in clipboard
+        ok = MARKER in text and MARKER in clipboard and PASTE_MARKER in clipboard
 
         state["copy_output_to_windows"] = ok
         print(
-            f"5. 复制全部输出（Linux→Windows）：{len(text.splitlines())} 行，"
-            f"剪贴板含标记={MARKER in clipboard}",
+            f"6. 复制全部输出（Linux→Windows）：{len(text.splitlines())} 行，剪贴板含标记={MARKER in clipboard}",
             flush=True,
         )
 
         QTimer.singleShot(200, step_save_output)
 
     # ------------------------------------------------------------------
-    # 6) 输出另存
+    # 7) 输出另存
     # ------------------------------------------------------------------
     def step_save_output() -> None:
         size = pane.view.save_output(output_file)
@@ -295,17 +307,16 @@ def main() -> int:
         ok = size > 0 and MARKER in content
 
         state["save_output"] = ok
-        print(f"6. 输出另存：{output_file.name} {size} 字节，含标记={MARKER in content}", flush=True)
+        print(f"7. 输出另存：{output_file.name} {size} 字节，含标记={MARKER in content}", flush=True)
 
         QTimer.singleShot(200, step_terminal_cut)
 
     # ------------------------------------------------------------------
-    # 7) 终端剪切 + 选中即复制
+    # 8) 终端剪切 + 选中即复制
     # ------------------------------------------------------------------
     def step_terminal_cut() -> None:
         view = pane.view
 
-        # 造一个覆盖首行的选区
         view._anchor = (0, 0)
         view._cursor_cell = (0, 60)
         app.processEvents()
@@ -316,29 +327,22 @@ def main() -> int:
         cleared = view._selection_range() is None
 
         state["terminal_cut"] = bool(cut_text) and cleared
-        print(f"7. 终端剪切：剪贴板 {len(cut_text)} 字符，选区已清空={cleared}", flush=True)
+        print(f"8. 终端剪切：剪贴板 {len(cut_text)} 字符，选区已清空={cleared}", flush=True)
 
-        # 选中即复制开关
-        view.select_to_copy = False
         window.set_select_to_copy(False)
         off_flag = view.select_to_copy is False
         window.set_select_to_copy(True)
         on_flag = view.select_to_copy is True
 
-        panes_seen = [id(pane_item) for pane_item in window._all_terminal_panes_all()]
-        print(f"   [diag] 主窗口收集到的终端面板={panes_seen}，当前 pane={id(pane)}，flag={view.select_to_copy}", flush=True)
-
         QGuiApplication.clipboard().clear()
         view._anchor = (0, 0)
         view._cursor_cell = (3, 40)
-        selected = view.selected_text()
         view.mouseReleaseEvent(None)  # type: ignore[arg-type]
         copied = QGuiApplication.clipboard().text()
 
         state["select_to_copy"] = off_flag and on_flag and bool(copied)
         print(
-            f"8. 选中即复制：off={off_flag} on={on_flag} flag={view.select_to_copy} "
-            f"选中文本={len(selected)} 字符，剪贴板 {len(copied)} 字符",
+            f"9. 选中即复制：off={off_flag} on={on_flag}，松开鼠标后剪贴板 {len(copied)} 字符",
             flush=True,
         )
 

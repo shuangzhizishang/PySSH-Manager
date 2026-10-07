@@ -158,11 +158,6 @@ class MainWindow(QMainWindow):
         self.action_record.setShortcut(QKeySequence("Ctrl+Shift+R"))
         self.action_record.triggered.connect(self.toggle_recording)
 
-        self.action_toggle_command_bar = QAction("命令输入栏", self)
-        self.action_toggle_command_bar.setShortcut(QKeySequence("Ctrl+`"))
-        self.action_toggle_command_bar.setToolTip("显示/隐藏命令输入框（Enter 发送到 Linux）")
-        self.action_toggle_command_bar.triggered.connect(self.toggle_command_bar)
-
         self.action_command_library = QAction("命令库（收藏 / 历史）", self)
         self.action_command_library.setShortcut(QKeySequence("Ctrl+Shift+L"))
         self.action_command_library.triggered.connect(self.open_command_library)
@@ -175,8 +170,17 @@ class MainWindow(QMainWindow):
         self.action_save_output.setShortcut(QKeySequence("Ctrl+Alt+S"))
         self.action_save_output.triggered.connect(self.save_all_output)
 
+        self.action_favorite_selection = QAction("把选中内容收藏为命令", self)
+        self.action_favorite_selection.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self.action_favorite_selection.setToolTip("把终端里选中的文字存进命令库")
+        self.action_favorite_selection.triggered.connect(self.favorite_selection)
+
         self.action_select_to_copy = QAction("选中即复制（Linux→Windows）", self)
         self.action_select_to_copy.setToolTip("鼠标选中终端文字后自动复制到 Windows 剪贴板")
+        # 先设好初始状态再连信号：菜单是在创建 tabs_widget 之前构建的，
+        # 若先连接，setChecked(True) 会立刻触发槽函数去访问还不存在的控件。
+        self.action_select_to_copy.setCheckable(True)
+        self.action_select_to_copy.setChecked(True)
         self.action_select_to_copy.toggled.connect(self.set_select_to_copy)
 
         self.action_replay = QAction("回放录制…", self)
@@ -259,14 +263,12 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self.action_copy)
         edit_menu.addAction(self.action_paste)
         edit_menu.addSeparator()
-        edit_menu.addAction(self.action_toggle_command_bar)
         edit_menu.addAction(self.action_command_library)
+        edit_menu.addAction(self.action_favorite_selection)
         edit_menu.addSeparator()
         edit_menu.addAction(self.action_copy_output)
         edit_menu.addAction(self.action_save_output)
         edit_menu.addSeparator()
-        self.action_select_to_copy.setCheckable(True)
-        self.action_select_to_copy.setChecked(True)
         edit_menu.addAction(self.action_select_to_copy)
 
         self.host_list = QListWidget()
@@ -673,10 +675,15 @@ class MainWindow(QMainWindow):
         普通连接路径把标签追加到了临时列表上，导致退出时漏关会话。
         """
 
+        tabs_widget = getattr(self, "tabs_widget", None)
+
+        if tabs_widget is None:  # 界面还在构建中（菜单动作可能在控件创建前触发）
+            return []
+
         return [
-            self.tabs_widget.widget(row)
-            for row in range(self.tabs_widget.count())
-            if isinstance(self.tabs_widget.widget(row), (SessionTab, SplitTerminalTab))
+            tabs_widget.widget(row)
+            for row in range(tabs_widget.count())
+            if isinstance(tabs_widget.widget(row), (SessionTab, SplitTerminalTab))
         ]
 
     def _ensure_credential(self, host: Host) -> str | None:
@@ -1457,30 +1464,37 @@ class MainWindow(QMainWindow):
         has_terminal = bool(self._all_terminal_panes())
 
         for action in (
-            self.action_toggle_command_bar,
             self.action_command_library,
+            self.action_favorite_selection,
             self.action_copy_output,
             self.action_save_output,
         ):
             action.setEnabled(has_terminal)
 
-    def toggle_command_bar(self) -> None:
-        panes = self._all_terminal_panes()
+    def favorite_selection(self) -> None:
+        """把终端选中内容收藏成一条命令。"""
 
-        if not panes:
-            self.statusBar().showMessage("当前标签没有终端")
+        from ..commands import get_store
+
+        pane = self._focused_terminal()
+
+        if pane is None:
+            self.statusBar().showMessage("当前没有活动会话")
             return
 
-        # 以第一个面板为准统一切换，避免分屏里有的显示有的隐藏
-        show = not panes[0].command_bar_visible
+        text = pane.view.selected_text().strip()
 
-        for pane in panes:
-            pane.set_command_bar_visible(show)
+        if not text:
+            self.statusBar().showMessage("先在终端里选中要收藏的命令")
+            return
 
-        if show:
-            panes[0].command_bar.focus_input()
+        snippet = get_store().add(text, host_id=pane.host.id if pane.host is not None else "")
 
-        self.statusBar().showMessage(f"命令输入栏已{'显示' if show else '收起'}")
+        if snippet is None:
+            self.statusBar().showMessage("这条命令已经在收藏里了")
+            return
+
+        self.statusBar().showMessage("已收藏到命令库（Ctrl+Shift+L 打开）")
 
     def open_command_library(self) -> None:
         from ..commands import get_store
@@ -1516,7 +1530,10 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("当前没有活动会话")
             return
 
-        pane.save_output()
+        size = pane.save_output()
+
+        if size:
+            self.statusBar().showMessage(f"输出已保存（{size} 字节）")
 
     def set_select_to_copy(self, enabled: bool) -> None:
         for pane in self._all_terminal_panes_all():
@@ -1539,6 +1556,28 @@ class MainWindow(QMainWindow):
                 panes.append(tab)
 
         return panes
+
+    def _paste_clipboard_to_remote(self) -> bool:
+        """把 Windows 剪贴板内容发给远端（Windows→Linux）。"""
+
+        from PySide6.QtGui import QGuiApplication
+
+        pane = self._focused_terminal()
+
+        if pane is None:
+            self.statusBar().showMessage("当前没有活动会话")
+            return False
+
+        text = QGuiApplication.clipboard().text()
+
+        if not text:
+            self.statusBar().showMessage("Windows 剪贴板是空的")
+            return False
+
+        pane.send_raw(text)
+        self.statusBar().showMessage(f"已把剪贴板 {len(text)} 个字符发送到 Linux")
+
+        return True
 
     def paste_to_terminal(self) -> None:
         pane = self._focused_terminal()

@@ -244,7 +244,11 @@ class CommandLibraryDialog(QDialog):
         keyword = self.search.text().strip()
         items = self.store.snippets_for(self.host_id, group=group, keyword=keyword)
 
+        # 刷新前记住选中项：发送/使用次数变化后列表会重建，不保留的话用户会"丢选中"
+        keep = set(self.selected_snippet_ids())
+
         self.table.setRowCount(0)
+        restored = 0
 
         for snippet in items:
             row = self.table.rowCount()
@@ -258,8 +262,12 @@ class CommandLibraryDialog(QDialog):
             self.table.setItem(row, 2, QTableWidgetItem(snippet.note))
             self.table.setItem(row, 3, QTableWidgetItem(str(snippet.use_count)))
 
+            if snippet.id in keep:
+                self.table.selectRow(row)
+                restored += 1
+
         self._update_buttons()
-        self._set_status(f"收藏 {len(items)} 条 · {self.clipboard.summary()}")
+        self._set_status(f"收藏 {len(items)} 条（选中 {restored} 条）· {self.clipboard.summary()}")
 
     def refresh_history(self) -> None:
         keyword = self.history_search.text().strip()
@@ -298,7 +306,37 @@ class CommandLibraryDialog(QDialog):
             if value:
                 ids.append(value)
 
+        # 没有任何"选中行"时回退到当前行：用户点了某个单元格就算选中它，
+        # 这样按钮不会因为 Qt 选择模型的差异而失效。
+        if not ids:
+            row = self.table.currentRow()
+            item = self.table.item(row, 0) if row >= 0 else None
+
+            if item is not None:
+                value = item.data(Qt.ItemDataRole.UserRole)
+
+                if value:
+                    ids.append(value)
+
         return ids
+
+    def select_ids(self, snippet_ids: list[str]) -> int:
+        """按 id 选中若干行（供按钮/自动化使用），返回选中的行数。"""
+
+        self.table.clearSelection()
+        count = 0
+
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+
+            if item is None or item.data(Qt.ItemDataRole.UserRole) not in set(snippet_ids):
+                continue
+
+            self.table.setCurrentCell(row, 0)
+            self.table.selectRow(row)
+            count += 1
+
+        return count
 
     def selected_snippets(self):
         return [item for item in (self.store.get(sid) for sid in self.selected_snippet_ids()) if item is not None]
