@@ -33,6 +33,13 @@ ROOT = Path(__file__).resolve().parent.parent
 SPEC = ROOT / "packaging" / "PySSH-Manager.spec"
 DIST = ROOT / "dist"
 
+# 控制台可能是 cp1252/GBK，打中文/✔ 会抛 UnicodeEncodeError（CI 上踩过）
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 def read_version() -> str:
     import re

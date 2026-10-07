@@ -9,9 +9,17 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from PIL import Image, ImageDraw
+
+# 控制台可能是 cp1252/GBK，直接 print 中文会抛 UnicodeEncodeError（CI 上踩过）
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 #: 与界面主题一致的配色
 BG = (13, 17, 23, 255)          # #0d1117

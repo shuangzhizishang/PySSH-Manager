@@ -14,6 +14,12 @@ on:
 permissions:
   contents: write
 
+# Windows runner 的默认代码页不是 UTF-8，脚本里打印中文会抛 UnicodeEncodeError，
+# 统一强制 UTF-8（脚本内部也做了 reconfigure 兜底）。
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+
 jobs:
   test:
     name: 单元测试
