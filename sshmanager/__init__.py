@@ -10,5 +10,5 @@
 - ``ui``           主窗口、侧边栏、会话标签、连接对话框
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 APP_NAME = "PySSH Manager"
