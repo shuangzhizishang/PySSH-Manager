@@ -76,8 +76,9 @@ class TerminalView(QAbstractScrollArea):
         #: 鼠标松开时自动把选中内容复制到 Windows 剪贴板（PuTTY 风格）
         self.select_to_copy = True
 
-        # 回滚：offset 表示视口相对「屏幕顶部」向上偏移的行数
+        # 回滚：offset 表示视口相对「虚拟轴末尾」向上偏移的行数
         self._offset = 0
+        self._last_total = self.emulator.lines
 
         # 选区
         self._anchor: tuple[int, int] | None = None
@@ -164,7 +165,7 @@ class TerminalView(QAbstractScrollArea):
             self._last_title = title
             self.title_changed.emit(title)
 
-        self._sync_scrollbar()
+        self._track_output()
         self.viewport().update()
 
     def resizeEvent(self, event):  # noqa: N802
@@ -198,19 +199,58 @@ class TerminalView(QAbstractScrollArea):
     # ------------------------------------------------------------------
     # 滚动
     #
-    # 回滚历史直接用 pyte HistoryScreen 自带的 history，不再自己推断滚屏：
-    # 早期版本靠逐行比对猜「滚了几行」，会在每次输出时误判并不断累加
-    # offset，最终把画面整个推出视口（表现为终端一片空白）。
+    # 坐标模型：把「回滚历史 + 当前屏幕 + 底部历史」看成一条**虚拟行轴**，
+    # 视口只是这条轴上的一个窗口：
+    #
+    #     虚拟行 0  ────────────  history.top（越往上越旧）
+    #               ────────────  当前屏幕（emulator.lines 行）
+    #               ────────────  history.bottom
+    #     最后一行  ────────────  最新输出
+    #
+    # ``_offset`` = 视口底部距离虚拟轴末尾多少行：0 表示贴底（跟随最新输出）。
+    #
+    # 旧实现直接用「屏幕行 + 历史行数」当 y 坐标，且只绘制屏幕行——
+    # 一旦历史行数超过视口高度，当前屏幕就被推到视口下方，终端整屏黑
+    # （下载大文件时输出滚得快，最容易触发）。
     # ------------------------------------------------------------------
 
     @property
     def _history_top(self):
         return self.emulator.screen.history.top
 
-    def _max_offset(self) -> int:
-        """最多能向上回看多少行。"""
+    @property
+    def _history_bottom(self):
+        return self.emulator.screen.history.bottom
 
-        return len(self._history_top)
+    def _total_lines(self) -> int:
+        """虚拟轴总行数。"""
+
+        return len(self._history_top) + self.emulator.lines + len(self._history_bottom)
+
+    def _viewport_rows(self) -> int:
+        """视口能显示多少行。"""
+
+        viewport = self.viewport()
+        height = viewport.height() if viewport is not None else self.height()
+
+        return max(1, int(height // max(1, self._cell.height())))
+
+    def _max_offset(self) -> int:
+        """最多能向上回看多少行（内容不足一屏时为 0）。"""
+
+        return max(0, self._total_lines() - self._viewport_rows())
+
+    def _first_view_row(self) -> int:
+        """视口第一行对应的虚拟行号。
+
+        内容不足一屏时返回 0：画面从**顶部**开始排，多余空白留在下方
+        （真实终端就是这样，不能把内容顶到视口底部）。
+        """
+
+        return max(0, self._total_lines() - self._offset - self._viewport_rows())
+
+    def _virtual_at_view(self, view_row: int) -> int:
+        return self._first_view_row() + view_row
 
     def _sync_scrollbar(self) -> None:
         bar = self.verticalScrollBar()
@@ -220,7 +260,7 @@ class TerminalView(QAbstractScrollArea):
 
         bar.blockSignals(True)
         bar.setRange(0, maximum)
-        bar.setPageStep(max(1, self.emulator.lines))
+        bar.setPageStep(max(1, self._viewport_rows()))
         bar.setValue(maximum - self._offset)
         bar.blockSignals(False)
 
@@ -228,53 +268,28 @@ class TerminalView(QAbstractScrollArea):
         self._offset = self._max_offset() - value
         self.viewport().update()
 
-    def _line_index_for_row(self, row: int) -> int:
-        """屏幕行 row 在当前滚动位置下对应的「历史 + 屏幕」行号。"""
+    def _track_output(self) -> None:
+        """新输出到达后的滚动处理。
 
-        return len(self._history_top) - self._offset + row
+        贴底时继续跟随最新输出；已经向上翻看历史时，保持正在看的那段内容不动
+        （否则输出一多，画面就会自己滑走）。
+        """
 
-    def _history_line(self, index: int):
-        top = self._history_top
+        total = self._total_lines()
+        delta = total - self._last_total
+        self._last_total = total
 
-        if 0 <= index < len(top):
-            return top[index]
+        if delta > 0 and self._offset > 0:
+            self._offset = min(self._max_offset(), self._offset + delta)
 
-        bottom_offset = index - (len(top) + self.emulator.lines)
+        self._sync_scrollbar()
 
-        if 0 <= bottom_offset < len(self.emulator.screen.history.bottom):
-            return self.emulator.screen.history.bottom[bottom_offset]
+    # ------------------------------------------------------------------
+    # 按虚拟行取内容
+    # ------------------------------------------------------------------
 
-        return None
-
-    def _row_text(self, row: int) -> str:
-        """屏幕行 row 在当前滚动位置下的纯文本。"""
-
-        index = self._line_index_for_row(row)
-
-        if index < 0 or index >= len(self._history_top):
-            lines = self.emulator.visible_lines()
-            screen_index = index - len(self._history_top)
-
-            if 0 <= screen_index < len(lines):
-                return lines[screen_index]
-
-            line = self._history_line(index)
-
-            if line is None:
-                return ""
-
-            return "".join(line[column].data for column in range(self.emulator.columns)).rstrip()
-
-        line = self._history_top[index]
-
-        if line is None:
-            return ""
-
-        return "".join(line[column].data for column in range(self.emulator.columns)).rstrip()
-
-    def _cell_from_history(self, line, column: int):
-        char = line.get(column)
-
+    @staticmethod
+    def _cell_from_char(char) -> tuple[str, CellStyle] | None:
         if char is None:
             return None
 
@@ -287,6 +302,101 @@ class TerminalView(QAbstractScrollArea):
             strikethrough=char.strikethrough,
             reverse=char.reverse,
         )
+
+    def _history_line(self, index: int):
+        """历史行（top 之后接 bottom），越界返回 None。"""
+
+        top = self._history_top
+
+        if 0 <= index < len(top):
+            return top[index]
+
+        bottom_index = index - (len(top) + self.emulator.lines)
+        bottom = self._history_bottom
+
+        if 0 <= bottom_index < len(bottom):
+            return bottom[bottom_index]
+
+        return None
+
+    def _line_text(self, virtual: int) -> str:
+        """虚拟行上的纯文本（越界返回空串）。"""
+
+        columns = self.emulator.columns
+        top = self._history_top
+
+        if 0 <= virtual < len(top):
+            line = top[virtual]
+
+            return "".join(line[column].data if column in line else " " for column in range(columns)).rstrip()
+
+        screen_start = len(top)
+
+        if screen_start <= virtual < screen_start + self.emulator.lines:
+            lines = self.emulator.visible_lines()
+            index = virtual - screen_start
+
+            return lines[index].rstrip() if 0 <= index < len(lines) else ""
+
+        line = self._history_line(virtual)
+
+        if line is None:
+            return ""
+
+        return "".join(line[column].data if column in line else " " for column in range(columns)).rstrip()
+
+    def _cell_at_virtual(self, virtual: int, column: int) -> tuple[str, CellStyle] | None:
+        """虚拟行某列的字符与属性（历史行同样带属性，pyte 会保留配色）。"""
+
+        if not (0 <= column < self.emulator.columns):
+            return None
+
+        top = self._history_top
+        screen_start = len(top)
+
+        if virtual < screen_start:
+            return self._cell_from_char(top[virtual].get(column)) if virtual >= 0 else None
+
+        if virtual < screen_start + self.emulator.lines:
+            line = self.emulator.screen.buffer.get(virtual - screen_start)
+
+            return self._cell_from_char(line.get(column)) if line is not None else None
+
+        line = self._history_line(virtual)
+
+        return self._cell_from_char(line.get(column)) if line is not None else None
+
+    def _cell_from_history(self, line, column: int):
+        """兼容旧接口：从历史行取单元格。"""
+
+        return self._cell_from_char(line.get(column) if line is not None else None)
+
+    # --- 视口坐标：绘制 / 命中测试 / 选区统一用「视口第几行」 ---
+
+    def _row_text(self, view_row: int) -> str:
+        """视口第 view_row 行显示的文字（0 = 视口最上面一行）。"""
+
+        return self._line_text(self._virtual_at_view(view_row))
+
+    def _is_history_row(self, view_row: int) -> bool:
+        """该视口行是否来自回滚历史。"""
+
+        return self._virtual_at_view(view_row) < len(self._history_top)
+
+    def _cell_at(self, view_row: int, column: int) -> tuple[str, CellStyle] | None:
+        """取视口坐标 (view_row, column) 处的字符与属性。"""
+
+        return self._cell_at_virtual(self._virtual_at_view(view_row), column)
+
+    def _view_row_for_screen_row(self, screen_row: int) -> int:
+        """当前屏幕的第 screen_row 行落在视口第几行；不在视口内返回 -1。"""
+
+        if not (0 <= screen_row < self.emulator.lines):
+            return -1
+
+        view_row = len(self._history_top) + screen_row - self._first_view_row()
+
+        return view_row if 0 <= view_row < self._viewport_rows() else -1
 
     def wheelEvent(self, event):  # noqa: N802
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -353,28 +463,27 @@ class TerminalView(QAbstractScrollArea):
         cell_height = self._cell.height()
 
         columns = self.emulator.columns
-        lines = self.emulator.lines
-        baseline = self._cell.height() - QFontMetricsF(self._font).descent() - 1
+        baseline = cell_height - QFontMetricsF(self._font).descent() - 1
 
-        # 历史行不足一屏时，画面从底部开始排（与真实终端一致）
-        history_rows = len(self._history_top)
-        shift = max(0, self.viewport().height() // cell_height - (history_rows + lines))
+        # 视口 = 虚拟轴上的一个窗口；视口第 view_row 行就是第 first + view_row 虚拟行
+        total = self._total_lines()
+        first = self._first_view_row()
+        view_rows = self._viewport_rows()
 
-        def row_y(row: int) -> int:
-            return (row + history_rows - self._offset + shift) * cell_height
+        visible = [
+            (view_row, first + view_row)
+            for view_row in range(view_rows)
+            if first + view_row < total
+        ]
 
         selection = self._selection_range()
 
-        # 底色层：铺每个单元的 ANSI 背景色（历史行没有属性，跳过）
-        for row in range(lines):
-            top = row_y(row)
-
-            if top + cell_height < 0 or top > height:
-                continue
+        # 底色层：铺每个单元的 ANSI 背景色
+        for view_row, virtual in visible:
+            top = view_row * cell_height
 
             for column in range(columns):
-                cell = self._cell_at(row, column)
-
+                cell = self._cell_at_virtual(virtual, column)
                 background = None
 
                 if cell is not None:
@@ -392,38 +501,39 @@ class TerminalView(QAbstractScrollArea):
                         background,
                     )
 
-        # 选区
+        # 选区（选区记的是虚拟行号，滚动时跟着内容走）
         if selection:
             (start_row, start_column), (end_row, end_column) = selection
 
-            for row in range(start_row, end_row + 1):
-                first = start_column if row == start_row else 0
-                last = end_column if row == end_row else columns - 1
+            for virtual in range(start_row, end_row + 1):
+                view_row = virtual - first
 
-                if last < first:
+                if not (0 <= view_row < view_rows):
+                    continue
+
+                first_column = start_column if virtual == start_row else 0
+                last_column = end_column if virtual == end_row else columns - 1
+
+                if last_column < first_column:
                     continue
 
                 painter.fillRect(
                     QRect(
-                        first * cell_width,
-                        row_y(row),
-                        (last - first + 1) * cell_width,
+                        first_column * cell_width,
+                        view_row * cell_height,
+                        (last_column - first_column + 1) * cell_width,
                         cell_height,
                     ),
                     QColor(self._theme["selection"]),
                 )
 
         # 文本层
-        for row in range(lines):
-            top = row_y(row)
-
-            if top + cell_height < 0 or top > height:
-                continue
-
+        for view_row, virtual in visible:
+            top = view_row * cell_height
             y = top + baseline
 
             for column in range(columns):
-                cell = self._cell_at(row, column)
+                cell = self._cell_at_virtual(virtual, column)
 
                 if cell is None:
                     continue
@@ -433,15 +543,9 @@ class TerminalView(QAbstractScrollArea):
                 if char == " " and style.bg in ("default", "") and not style.reverse:
                     continue
 
-                # 回滚出来的历史行没有属性信息，用默认色
-                if self._is_history_row(row):
-                    color = QColor(self._theme["foreground"])
-                    font = self._font
-                else:
-                    color = self._resolve_color(style.bg if style.reverse else style.fg)
-                    font = self._styled_font(style)
+                color = self._resolve_color(style.bg if style.reverse else style.fg)
 
-                painter.setFont(font)
+                painter.setFont(self._styled_font(style))
                 painter.setPen(color)
                 painter.drawText(column * cell_width, y, char)
 
@@ -450,15 +554,17 @@ class TerminalView(QAbstractScrollArea):
         # 光标（只在贴底时显示）
         if self._offset == 0 and self.hasFocus() and self.emulator.cursor_visible:
             cursor = self.emulator.cursor
-            cursor_top = row_y(cursor.y)
+            cursor_view_row = self._view_row_for_screen_row(cursor.y)
 
-            if 0 <= cursor_top <= height - cell_height:
+            if cursor_view_row >= 0:
+                cursor_top = cursor_view_row * cell_height
+
                 painter.fillRect(
                     QRect(cursor.x * cell_width, cursor_top, cell_width, cell_height),
                     QColor(self._theme["cursor"]),
                 )
 
-                cell = self._cell_at(cursor.y, cursor.x)
+                cell = self._cell_at_virtual(len(self._history_top) + cursor.y, cursor.x)
 
                 if cell is not None and cell[0] != " ":
                     painter.setPen(QColor(self._theme["background"]))
@@ -466,52 +572,6 @@ class TerminalView(QAbstractScrollArea):
                     painter.drawText(cursor.x * cell_width, cursor_top + baseline, cell[0])
 
         painter.end()
-
-    def _is_history_row(self, row: int) -> bool:
-        """该视口行是否来自回滚历史（而非当前屏幕）。"""
-
-        return self._line_index_for_row(row) < len(self._history_top)
-
-    def _cell_at(self, row: int, column: int) -> tuple[str, CellStyle] | None:
-        """取视口坐标 (row, column) 处的字符与属性。"""
-
-        if not (0 <= row < self.emulator.lines):
-            return None
-
-        index = self._line_index_for_row(row)
-
-        if index < len(self._history_top):
-            line = self._history_top[index] if index >= 0 else None
-
-            if line is None:
-                return None
-
-            return self._cell_from_history(line, column)
-
-        screen_row = index - len(self._history_top)
-
-        if not (0 <= screen_row < self.emulator.lines):
-            return None
-
-        line = self.emulator.screen.buffer.get(screen_row)
-
-        if line is None:
-            return None
-
-        char = line.get(column)
-
-        if char is None:
-            return None
-
-        return char.data, CellStyle(
-            fg=char.fg,
-            bg=char.bg,
-            bold=char.bold,
-            italics=char.italics,
-            underscore=char.underscore,
-            strikethrough=char.strikethrough,
-            reverse=char.reverse,
-        )
 
     def _styled_font(self, style: CellStyle) -> QFont:
         font = QFont(self._font)
@@ -535,10 +595,14 @@ class TerminalView(QAbstractScrollArea):
         return first, second
 
     def _cell_from_point(self, point: QPoint) -> tuple[int, int]:
-        column = max(0, min(self.emulator.columns - 1, point.x() // self._cell.width()))
-        row = max(0, min(self.emulator.lines - 1, point.y() // self._cell.height()))
+        """鼠标位置 → 虚拟行号 + 列（选区跟着内容走，滚动也不会错位）。"""
 
-        return row, column
+        column = max(0, min(self.emulator.columns - 1, point.x() // self._cell.width()))
+        view_row = max(0, min(self._viewport_rows() - 1, point.y() // self._cell.height()))
+        total = self._total_lines()
+        virtual = min(max(0, total - 1), self._first_view_row() + view_row) if total else 0
+
+        return virtual, column
 
     def mousePressEvent(self, event):  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
@@ -572,14 +636,14 @@ class TerminalView(QAbstractScrollArea):
         (start_row, start_column), (end_row, end_column) = selection
         lines = []
 
-        for row in range(start_row, end_row + 1):
-            text = self._row_text(row)
+        for virtual in range(start_row, end_row + 1):
+            text = self._line_text(virtual)
 
-            if row == start_row and row == end_row:
+            if virtual == start_row and virtual == end_row:
                 lines.append(text[start_column : end_column + 1])
-            elif row == start_row:
+            elif virtual == start_row:
                 lines.append(text[start_column:])
-            elif row == end_row:
+            elif virtual == end_row:
                 lines.append(text[: end_column + 1])
             else:
                 lines.append(text)
@@ -616,23 +680,10 @@ class TerminalView(QAbstractScrollArea):
         self.viewport().update()
 
     def output_text(self, include_history: bool = True) -> str:
-        """把终端输出取成纯文本：回滚区（可选）+ 当前屏幕。"""
+        """把终端输出取成纯文本：整条虚拟轴（历史 + 当前屏幕 + 底部历史）。"""
 
-        lines: list[str] = []
-
-        if include_history:
-            history = self._history_top
-
-            for index in range(len(history)):
-                line = self._history_line(index)
-
-                if line is None:
-                    continue
-
-                lines.append("".join(cell.data for cell in line).rstrip())
-
-        for row in range(self.emulator.lines):
-            lines.append(self._row_text(row).rstrip())
+        start = 0 if include_history else len(self._history_top)
+        lines = [self._line_text(virtual) for virtual in range(start, self._total_lines())]
 
         # 去掉尾部空行
         while lines and not lines[-1]:

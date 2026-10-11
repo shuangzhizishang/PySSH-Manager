@@ -275,9 +275,12 @@ $env:QT_QPA_PLATFORM='offscreen'
 
 # SFTP 复制/剪切/粘贴/撤销（四个方向 + 回收站）
 .venv\Scripts\python.exe tests\copy_paste_e2e.py --host 192.168.206.130 --password <密码>
+
+# 重输出渲染（模拟 yum/docker 刷屏 + \r 进度条，验证终端不黑屏）
+.venv\Scripts\python.exe tests\heavy_output_e2e.py --host 192.168.206.130 --password <密码>
 ```
 
-## 九个已踩过的坑（改动时注意）
+## 十个已踩过的坑（改动时注意）
 
 1. **必须使用 Fusion 样式**：Qt 6.11 在 Windows 上默认用 `windows11` 原生样式，
    该样式会忽略自定义 `QPainter` 的画笔颜色，终端文字会被画成系统默认文字色，
@@ -320,3 +323,14 @@ $env:QT_QPA_PLATFORM='offscreen'
    **之前**构建的，若先连接 `toggled`，`setChecked(True)` 会立刻触发槽函数去访问
    还不存在的控件，启动即崩（`AttributeError: 'MainWindow' object has no attribute
    'tabs_widget'`）。同理，从控件现算的辅助函数要对"控件尚未创建"做保护。
+10. **终端渲染必须走"虚拟行轴"，不能给屏幕行加历史偏移**：旧实现用
+    `row_y(row) = (row + 历史行数 - offset) * 行高` 且只绘制「屏幕行」——
+    一旦历史行数超过视口高度（下载大文件时输出滚得快，最容易触发），
+    当前屏幕就被推到视口下方，**终端整屏黑**（实测 296 行历史时首行 y=5624px，
+    而视口只有 98px）。正确做法：把 `history.top + 当前屏幕 + history.bottom`
+    当成一条虚拟轴，视口只是轴上的一个窗口
+    `first = max(0, 总数 - offset - 视口行数)`，第 `i` 行画在 `i * 行高`；
+    内容不足一屏时从**顶部**开始画（空白留在下方），不要为了"贴底"把内容顶下去。
+    选区也改成记虚拟行号，滚动时不会错位。
+    回归测试见 `tests/test_terminal_view.py::test_rendering_not_black_*`（直接抓取
+    渲染结果统计非背景像素），真实链路验证见 `tests/heavy_output_e2e.py`。
