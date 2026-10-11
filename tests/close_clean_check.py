@@ -23,7 +23,8 @@ from sshmanager.credentials import CredentialStore
 from sshmanager.hosts import Host, HostStore
 from sshmanager.ui import AppContext, MainWindow
 
-HOST = "192.168.206.130"
+#: 测试目标主机：用环境变量指定，避免把内网地址写进仓库
+HOST = os.environ.get("PYSSH_TEST_HOST", "127.0.0.1")
 
 
 def other_threads() -> list[str]:

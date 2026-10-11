@@ -36,7 +36,7 @@ FILE_SIZE = 512 * 1024
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="192.168.206.130")
+    parser.add_argument("--host", default="")
     parser.add_argument("--port", type=int, default=22)
     parser.add_argument("--username", default="root")
     parser.add_argument("--password", default="")

@@ -17,7 +17,8 @@ import time
 
 import paramiko
 
-HOST = "192.168.206.130"
+#: 测试目标主机：用环境变量指定，避免把内网地址写进仓库
+HOST = os.environ.get("PYSSH_TEST_HOST", "127.0.0.1")
 USER = "root"
 ECHO_PORT = 18991
 REMOTE_PORT = 19088

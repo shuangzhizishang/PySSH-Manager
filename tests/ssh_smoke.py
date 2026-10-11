@@ -1,12 +1,12 @@
 """真实 SSH 冒烟测试（单独运行，不参与 pytest 收集）。
 
-前置条件：默认目标 192.168.206.130:22 可达，root 密码已保存在凭据库中
-（首次由 main.py 的 LEGACY_PASSWORD 导入，或用 --password 参数传入）。
+前置条件：用 ``--host`` 指定可达的服务器，root 密码已保存在凭据库中
+（应用里连过一次即可；也可用 ``--password`` 传入）。
 
 运行::
 
     $env:QT_QPA_PLATFORM='offscreen'
-    .venv\\Scripts\\python.exe tests\\ssh_smoke.py --host 192.168.206.130 --username root
+    .venv\\Scripts\\python.exe tests\\ssh_smoke.py --host <你的服务器> --username root
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ COLOR_MARKER = "PYSSH_COLOR_OK"
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="192.168.206.130")
+    parser.add_argument("--host", default="")
     parser.add_argument("--port", type=int, default=22)
     parser.add_argument("--username", default="root")
     parser.add_argument("--password", default="")

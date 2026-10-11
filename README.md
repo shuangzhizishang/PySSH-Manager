@@ -3,15 +3,8 @@
 一个用 Python + PySide6 写的 SSH 连接管理器，目标是对齐 [Termius](https://termius.com/) 的核心体验：
 真终端仿真、多标签会话、主机列表与加密凭据、密钥认证、主机指纹校验。
 
-![主界面](docs/images/e2e-window.png)
-
-| SFTP（含本地 C/D 盘） | 分屏 |
-| --- | --- |
-| ![SFTP](docs/images/sftp-local-drives.png) | ![分屏](docs/images/split-view.png) |
-
-| 同一主机多会话 | 命令库（收藏 / 历史） |
-| --- | --- |
-| ![多会话](docs/images/multi-session.png) | ![命令库](docs/images/command-library.png) |
+界面由三部分组成：左侧主机列表（按标签分组、显示已开会话数）、中间多标签终端
+（可左右/上下分屏、同主机多会话）、以及工具标签页（SFTP 双栏、端口转发、本地终端、命令库）。
 
 ## 下载与安装（Windows）
 
@@ -111,7 +104,7 @@
 .venv\Scripts\python.exe packaging\build_windows.py --onefile --zip
 
 # 顺带验证真机连通性（会连 SSH / SFTP）
-.venv\Scripts\python.exe packaging\build_windows.py --host 192.168.206.130 --username root --password 你的密码
+.venv\Scripts\python.exe packaging\build_windows.py --host <你的服务器> --username root --password 你的密码
 ```
 
 产物：
@@ -127,7 +120,7 @@
 结果写进 JSON，全部通过才算打包成功。也可以手动跑：
 
 ```powershell
-dist\PySSH-Manager\PySSH-Manager.exe --selftest report.json --host 192.168.206.130 --username root --password 密码
+dist\PySSH-Manager\PySSH-Manager.exe --selftest report.json --host <你的服务器> --username root --password 密码
 ```
 
 自检做的事：导入 PySide6/paramiko/pyte/cryptography/argon2/winpty、检查随包资源
@@ -153,7 +146,7 @@ git push origin v0.2.0
 # 依赖（虚拟环境已就绪时跳过）
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 
-# 打开界面（默认连 192.168.206.130）
+# 打开界面（默认连 <你的服务器>）
 .venv\Scripts\python.exe main.py
 
 # 指定主机，并顺手把密码加密保存
@@ -247,43 +240,43 @@ $env:QT_QPA_PLATFORM='offscreen'
 .venv\Scripts\python.exe tests\gui_smoke.py
 
 # 真实 SSH 冒烟（连测试机执行命令并校验 ANSI 解析）
-.venv\Scripts\python.exe tests\ssh_smoke.py --host 192.168.206.130 --trust
+.venv\Scripts\python.exe tests\ssh_smoke.py --host <你的服务器> --trust
 
 # 真实 GUI 端到端（会短暂弹窗，并把截图写到 build/，被 .gitignore 忽略）
-.venv\Scripts\python.exe tests\gui_e2e.py --host 192.168.206.130 --password <密码>
+.venv\Scripts\python.exe tests\gui_e2e.py --host <你的服务器> --password <密码>
 
 # SFTP + 端口转发真实链路（上传/下载/重命名/删除 + ssh -L 回传校验）
-.venv\Scripts\python.exe tests\sftp_forward_smoke.py --host 192.168.206.130 --password <密码>
+.venv\Scripts\python.exe tests\sftp_forward_smoke.py --host <你的服务器> --password <密码>
 
 # SFTP 面板与端口转发对话框的 GUI 验证
-.venv\Scripts\python.exe tests\sftp_gui_e2e.py --host 192.168.206.130 --password <密码>
+.venv\Scripts\python.exe tests\sftp_gui_e2e.py --host <你的服务器> --password <密码>
 
 # 密钥认证（本地 paramiko 服务器，不需要外网）
 .venv\Scripts\python.exe tests\key_auth_smoke.py
 
 # 新功能 GUI 验证：本地终端 / 分屏 / 三类转发 / 导入导出
-.venv\Scripts\python.exe tests\gui_features_e2e.py --host 192.168.206.130 --password <密码>
+.venv\Scripts\python.exe tests\gui_features_e2e.py --host <你的服务器> --password <密码>
 
 # 密钥管理 / 标签分组 / 拖拽递归传输
-.venv\Scripts\python.exe tests\gui_extras_e2e.py --host 192.168.206.130 --password <密码>
+.venv\Scripts\python.exe tests\gui_extras_e2e.py --host <你的服务器> --password <密码>
 
 # 密钥生成（不需要联网）
 .venv\Scripts\python.exe tests\keygen_smoke.py
 
 # 会话录制/回放 + SFTP 断点续传
-.venv\Scripts\python.exe tests\recording_resume_e2e.py --host 192.168.206.130 --password <密码>
+.venv\Scripts\python.exe tests\recording_resume_e2e.py --host <你的服务器> --password <密码>
 
 # 命令功能：直接输入/粘贴、命令库、输出回拷、终端剪切
-.venv\Scripts\python.exe tests\command_features_e2e.py --host 192.168.206.130 --password <密码>
+.venv\Scripts\python.exe tests\command_features_e2e.py --host <你的服务器> --password <密码>
 
 # SFTP 复制/剪切/粘贴/撤销（四个方向 + 回收站）
-.venv\Scripts\python.exe tests\copy_paste_e2e.py --host 192.168.206.130 --password <密码>
+.venv\Scripts\python.exe tests\copy_paste_e2e.py --host <你的服务器> --password <密码>
 
 # 重输出渲染（模拟 yum/docker 刷屏 + \r 进度条，验证终端不黑屏）
-.venv\Scripts\python.exe tests\heavy_output_e2e.py --host 192.168.206.130 --password <密码>
+.venv\Scripts\python.exe tests\heavy_output_e2e.py --host <你的服务器> --password <密码>
 
 # SFTP 传输百分比（单文件上传/下载 + 目录批次进度）
-.venv\Scripts\python.exe tests\sftp_progress_e2e.py --host 192.168.206.130 --password <密码>
+.venv\Scripts\python.exe tests\sftp_progress_e2e.py --host <你的服务器> --password <密码>
 ```
 
 ## 十个已踩过的坑（改动时注意）
