@@ -17,6 +17,108 @@ CHUNK_SIZE = 64 * 1024
 
 
 @dataclass
+class TransferProgress:
+    """传输进度快照（供界面显示百分比 / 速度 / 剩余时间）。"""
+
+    task: str = "传输"
+    name: str = ""
+    done: int = 0
+    total: int = 0
+    batch_done: int = 0
+    batch_total: int = 0
+    index: int = 1
+    count: int = 1
+    speed: float = 0.0
+
+    @property
+    def percent(self) -> int:
+        """当前文件（或整个任务）百分比。"""
+
+        if self.total <= 0:
+            return 100 if self.done > 0 else 0
+
+        return max(0, min(100, int(self.done * 100 / self.total)))
+
+    @property
+    def batch_percent(self) -> int:
+        if self.batch_total <= 0:
+            return self.percent
+
+        return max(0, min(100, int(self.batch_done * 100 / self.batch_total)))
+
+    @property
+    def eta(self) -> float | None:
+        """预计剩余秒数；速度未知时返回 None。"""
+
+        if self.speed <= 0 or self.total <= 0:
+            return None
+
+        remaining = max(0, self.batch_total or self.total) - (self.batch_done or self.done)
+
+        return remaining / self.speed if remaining > 0 else 0.0
+
+    @property
+    def size_text(self) -> str:
+        """已传 / 总量。"""
+
+        if self.total <= 0:
+            return format_size(self.done)
+
+        return f"{format_size(self.done)}/{format_size(self.total)}"
+
+    @property
+    def batch_text(self) -> str:
+        if self.batch_total > 0:
+            return f"{format_size(self.batch_done)}/{format_size(self.batch_total)}"
+
+        return ""
+
+    @property
+    def speed_text(self) -> str:
+        if self.speed <= 0:
+            return ""
+
+        return f"{format_size(int(self.speed))}/s"
+
+    @property
+    def eta_text(self) -> str:
+        eta = self.eta
+
+        if eta is None:
+            return ""
+
+        if eta < 1:
+            return "即将完成"
+
+        if eta < 60:
+            return f"剩 {int(eta)} 秒"
+
+        if eta < 3600:
+            return f"剩 {int(eta // 60)} 分 {int(eta % 60)} 秒"
+
+        return f"剩 {eta / 3600:.1f} 小时"
+
+    def summary(self) -> str:
+        """一行摘要：任务 文件名 45%（3.2 MB/7.1 MB）· 1.8 MB/s · 剩 2 秒。"""
+
+        parts = [f"{self.task} {self.name}".strip(), f"{self.percent}%（{self.size_text}）"]
+
+        if self.count > 1:
+            parts.insert(1, f"第 {self.index}/{self.count} 项")
+
+        if self.batch_total > 0 and self.count > 1:
+            parts.append(f"总 {self.batch_percent}%")
+
+        if self.speed_text:
+            parts.append(self.speed_text)
+
+        if self.eta_text:
+            parts.append(self.eta_text)
+
+        return " · ".join(part for part in parts if part)
+
+
+@dataclass
 class RemoteEntry:
     """远端目录里的一条记录。"""
 
@@ -265,6 +367,47 @@ class SftpClient:
     # 目录递归传输
     # ------------------------------------------------------------------
 
+    def stat_size(self, path: str) -> int:
+        """远端文件大小（字节）；取不到返回 0。"""
+
+        try:
+            return int(self._client().stat(normalize_remote_path(path)).st_size)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def tree_size(self, remote_dir: str, limit: int = 4000) -> tuple[int, int]:
+        """递归统计远端目录的 ``(文件数, 总字节)``，用于显示整体百分比。
+
+        目录特别大时只扫到 ``limit`` 项就停（返回已知部分），避免传输前卡很久。
+        """
+
+        files = 0
+        total = 0
+        scanned = 0
+        stack = [normalize_remote_path(remote_dir)]
+
+        while stack:
+            current = stack.pop()
+
+            try:
+                entries = self.listdir(current)
+            except SFTPError:
+                continue
+
+            for entry in entries:
+                if entry.is_dir:
+                    stack.append(entry.path)
+                    continue
+
+                files += 1
+                total += max(0, entry.size)
+                scanned += 1
+
+                if scanned >= limit:
+                    return files, total
+
+        return files, total
+
     def upload_tree(
         self,
         local_dir: Path,
@@ -272,8 +415,13 @@ class SftpClient:
         progress=None,
         cancelled=None,
         resume: bool = False,
+        on_file=None,
     ) -> tuple[int, int]:
-        """递归上传目录，返回 ``(文件数, 字节数)``。"""
+        """递归上传目录，返回 ``(文件数, 字节数)``。
+
+        ``on_file(index, count, name)`` 在开始传每个文件时回调一次，
+        便于界面重置「当前文件」的百分比。
+        """
 
         local_dir = Path(local_dir)
         remote_dir = normalize_remote_path(remote_dir)
@@ -281,20 +429,31 @@ class SftpClient:
         total_bytes = 0
         self.mkdir_p(remote_dir)
 
-        for path in sorted(local_dir.rglob("*")):
+        paths = [path for path in sorted(local_dir.rglob("*")) if path.is_file()]
+
+        for index, path in enumerate(paths, start=1):
             if cancelled is not None and cancelled():
                 raise SFTPError("已取消")
 
             relative = path.relative_to(local_dir)
             target = normalize_remote_path(f"{remote_dir}/{relative.as_posix()}")
 
-            if path.is_dir():
-                self.mkdir_p(target)
-                continue
+            # 目录本身可能为空目录，需要显式建出来
+            if relative.parent != Path("."):
+                self.mkdir_p(normalize_remote_path(f"{remote_dir}/{relative.parent.as_posix()}"))
+
+            if on_file is not None:
+                on_file(index, len(paths), path.name)
 
             written, _resumed = self.upload(path, target, progress=progress, cancelled=cancelled, resume=resume)
             files += 1
             total_bytes += written
+
+        # 空目录也要建
+        for path in sorted(local_dir.rglob("*")):
+            if path.is_dir():
+                relative = path.relative_to(local_dir)
+                self.mkdir_p(normalize_remote_path(f"{remote_dir}/{relative.as_posix()}"))
 
         return files, total_bytes
 
@@ -305,6 +464,8 @@ class SftpClient:
         progress=None,
         cancelled=None,
         resume: bool = False,
+        on_file=None,
+        counter: list | None = None,
     ) -> tuple[int, int]:
         """递归下载目录，返回 ``(文件数, 字节数)``。"""
 
@@ -313,6 +474,7 @@ class SftpClient:
         local_dir.mkdir(parents=True, exist_ok=True)
         files = 0
         total_bytes = 0
+        state = counter if counter is not None else [0, 0]
 
         for entry in self.listdir(remote_dir):
             if cancelled is not None and cancelled():
@@ -325,10 +487,17 @@ class SftpClient:
                     progress=progress,
                     cancelled=cancelled,
                     resume=resume,
+                    on_file=on_file,
+                    counter=state,
                 )
                 files += sub_files
                 total_bytes += sub_bytes
                 continue
+
+            state[0] += 1
+
+            if on_file is not None:
+                on_file(state[0], state[1], entry.name)
 
             written, _resumed = self.download(
                 entry.path,

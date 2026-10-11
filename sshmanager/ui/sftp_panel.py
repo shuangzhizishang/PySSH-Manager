@@ -156,6 +156,9 @@ class SftpPanel(QWidget):
     title_changed = Signal(str)
     closed = Signal()
 
+    #: 传输进度文字（供主窗口更新标签标题），传输结束发空串
+    progress_text = Signal(str)
+
     def __init__(
         self,
         host: Host,
@@ -200,6 +203,7 @@ class SftpPanel(QWidget):
         self.worker.listing.connect(self._on_listing)
         self.worker.task_finished.connect(self._on_task_finished)
         self.worker.progress.connect(self._on_progress)
+        self.worker.progress_detail.connect(self._on_progress_detail)
         self.worker.batch_result.connect(self._on_batch_result)
         self.worker.start()
 
@@ -570,8 +574,17 @@ class SftpPanel(QWidget):
         self.resume_check.toggled.connect(self._on_resume_toggled)
 
         self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximumWidth(200)
+        self.progress_bar.setMinimumWidth(240)
+        self.progress_bar.setMaximumWidth(300)
         self.progress_bar.setVisible(False)
+        self.progress_bar.setTextVisible(True)  # 进度条里直接显示百分比
+        self.progress_bar.setFormat("%p%")
+
+        # 传输明细：任务 + 文件名 + 百分比 + 已传/总量 + 速度 + 剩余时间
+        self.transfer_label = QLabel("")
+        self.transfer_label.setStyleSheet("color: #8b949e;")
+        self.transfer_label.setMinimumWidth(200)
+        self.transfer_label.setVisible(False)
 
         for widget in (
             self.copy_button,
@@ -594,6 +607,7 @@ class SftpPanel(QWidget):
             row.addWidget(widget)
 
         row.addStretch()
+        row.addWidget(self.transfer_label)
         row.addWidget(self.progress_bar)
 
         return bar
@@ -1200,12 +1214,14 @@ class SftpPanel(QWidget):
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        self.progress_bar.setFormat(label)
+        self.progress_bar.setFormat("%p%")
+        self.transfer_label.setVisible(True)
+        self.transfer_label.setText(label)
         self.cancel_button.setEnabled(True)
 
     def _on_progress(self, task: str, done: int, total: int) -> None:
         self.progress_bar.setVisible(True)
-        self.progress_bar.setFormat(f"{task} %p%")
+        self.progress_bar.setFormat("%p%")
 
         if total > 0:
             self.progress_bar.setRange(0, 100)
@@ -1213,9 +1229,34 @@ class SftpPanel(QWidget):
         else:
             self.progress_bar.setRange(0, 0)
 
-    def _on_task_finished(self, task: str, success: bool, message: str) -> None:
+    def _on_progress_detail(self, progress) -> None:
+        """详细进度：进度条显示百分比，旁边显示已传/总量、速度、剩余时间。"""
+
+        self.progress_bar.setVisible(True)
+        self.transfer_label.setVisible(True)
+        self.cancel_button.setEnabled(True)
+
+        if progress.total > 0:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(progress.percent)
+            self.progress_bar.setFormat("%p%")
+        else:
+            # 总量未知（例如远端 stat 失败）用忙碌指示，文字仍显示已传字节
+            self.progress_bar.setRange(0, 0)
+
+        self.transfer_label.setText(progress.summary())
+        self._set_status(f"● 已连接 · {progress.task} {progress.percent}%", "#58a6ff")
+        self.progress_text.emit(progress.summary())
+
+    def _clear_progress(self) -> None:
         self.progress_bar.setVisible(False)
         self.progress_bar.setRange(0, 100)
+        self.transfer_label.setVisible(False)
+        self.transfer_label.setText("")
+        self.progress_text.emit("")
+
+    def _on_task_finished(self, task: str, success: bool, message: str) -> None:
+        self._clear_progress()
         self.cancel_button.setEnabled(False)
 
         if success:

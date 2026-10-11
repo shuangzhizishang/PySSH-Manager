@@ -732,12 +732,33 @@ class MainWindow(QMainWindow):
             return
 
         panel = SftpPanel(host, credential=credential, jump=self._jump_client_for(host))
+        panel.progress_text.connect(lambda text, h=host: self._on_transfer_progress(h, text))
         index = self.tabs_widget.addTab(panel, f"SFTP · {host.display_name}")
         self.tabs_widget.setTabToolTip(index, host.target)
         self.tabs_widget.setCurrentIndex(index)
 
         self.sftp_tabs[host.id] = panel
         self._update_window_title()
+
+    def _on_transfer_progress(self, host: Host, text: str) -> None:
+        """把 SFTP 传输百分比同时显示在标签标题与状态栏上。"""
+
+        panel = self.sftp_tabs.get(host.id)
+
+        if panel is None:
+            return
+
+        index = self.tabs_widget.indexOf(panel)
+
+        if index < 0:
+            return
+
+        if text:
+            self.tabs_widget.setTabText(index, f"{text[:60]} · {host.display_name}")
+            self.statusBar().showMessage(text)
+        else:
+            self.tabs_widget.setTabText(index, f"SFTP · {host.display_name}")
+            self.statusBar().showMessage("就绪")
 
     def open_forwards(self) -> None:
         host = self._selected_host()

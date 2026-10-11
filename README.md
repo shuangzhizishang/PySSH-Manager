@@ -64,6 +64,9 @@
   **支持拖拽**（本地文件/目录拖到远端即上传，远端条目拖到本地即下载）与**目录递归传输**，
   传输带进度条与取消；**断点续传**（下载写 `.part` 临时文件，成功后原子替换；
   重试只补缺失字节）
+- **传输进度带百分比**：进度条直接显示 `25%`，旁边是明细
+  `上传 payload.bin · 25%（2.0 MB/8.0 MB） · 13.4 MB/s · 剩 5 秒`；
+  标签标题与状态栏也同步显示百分比，目录/多项传输再显示「第 i/n 项 · 总 xx%」
 - **会话录制与回放**：录制为 asciicast v2 格式（可直接用 `asciinema play` 播放），
   应用内回放器支持播放 / 暂停 / 倍速 / 时间轴拖动
 - **SSH 密钥管理**：生成 Ed25519 / RSA 密钥（私钥可用口令加密）、查看/复制公钥、
@@ -278,6 +281,9 @@ $env:QT_QPA_PLATFORM='offscreen'
 
 # 重输出渲染（模拟 yum/docker 刷屏 + \r 进度条，验证终端不黑屏）
 .venv\Scripts\python.exe tests\heavy_output_e2e.py --host 192.168.206.130 --password <密码>
+
+# SFTP 传输百分比（单文件上传/下载 + 目录批次进度）
+.venv\Scripts\python.exe tests\sftp_progress_e2e.py --host 192.168.206.130 --password <密码>
 ```
 
 ## 十个已踩过的坑（改动时注意）

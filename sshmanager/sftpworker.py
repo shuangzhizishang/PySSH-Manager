@@ -8,14 +8,33 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
 from .fileops import SIDE_LOCAL, SIDE_REMOTE, copy_remote, move_remote, trash_remote
 from .hosts import Host
-from .sftpcore import SftpClient
+from .sftpcore import SftpClient, TransferProgress
 from .sshclient import SSHClient
+
+
+def _local_tree_size(path: Path) -> tuple[int, int]:
+    """本地目录的 ``(文件数, 总字节)``。"""
+
+    files = 0
+    total = 0
+
+    for item in Path(path).rglob("*"):
+        if item.is_file():
+            files += 1
+
+            try:
+                total += item.stat().st_size
+            except OSError:
+                pass
+
+    return files, total
 
 
 class SftpWorker(QThread):
@@ -35,6 +54,9 @@ class SftpWorker(QThread):
 
     #: 传输进度 (任务名, 已完成字节, 总字节)
     progress = Signal(str, int, int)
+
+    #: 详细传输进度：:class:`~sshmanager.sftpcore.TransferProgress`（含百分比 / 速度 / 剩余时间）
+    progress_detail = Signal(object)
 
     #: 致命错误（连接阶段）
     failed = Signal(str)
@@ -168,6 +190,63 @@ class SftpWorker(QThread):
 
     # ------------------------------------------------------------------
 
+    def _make_tracker(self, task: str, name: str, total_files: int, total_bytes: int):
+        """构造进度跟踪器：累计批次字节、估算速度，并发出粗细两种进度信号。
+
+        返回的函数签名是 ``(done, total)``（当前文件已传/总字节）；
+        另外挂了 ``file_started(index, count, name)`` 用于切换「当前文件」。
+        """
+
+        state = {
+            "index": 1,
+            "count": max(1, total_files or 1),
+            "name": name,
+            "batch_done": 0,
+            "current_total": 0,
+            "last_done": 0,
+            "started": time.monotonic(),
+            "speed": 0.0,
+        }
+
+        def report(done: int, total: int) -> None:
+            # 当前文件字节变化 = 批次增量的来源
+            delta = max(0, done - state["last_done"])
+            state["last_done"] = done
+            state["current_total"] = total or state["current_total"]
+            state["batch_done"] += delta
+
+            elapsed = max(0.001, time.monotonic() - state["started"])
+
+            # 速度用滑动平均，避免瞬间抖动
+            instant = state["batch_done"] / elapsed
+            state["speed"] = instant if state["speed"] <= 0 else state["speed"] * 0.7 + instant * 0.3
+
+            self.progress.emit(f"{task} {state['name']}", done, total)
+            self.progress_detail.emit(
+                TransferProgress(
+                    task=task,
+                    name=state["name"],
+                    done=done,
+                    total=state["current_total"],
+                    batch_done=state["batch_done"],
+                    batch_total=total_bytes,
+                    index=state["index"],
+                    count=state["count"],
+                    speed=state["speed"],
+                )
+            )
+
+        def file_started(index: int, count: int, current_name: str) -> None:
+            state["index"] = index
+            state["count"] = max(1, count)
+            state["name"] = current_name
+            state["last_done"] = 0
+            state["current_total"] = 0
+
+        report.file_started = file_started  # type: ignore[attr-defined]
+
+        return report
+
     def _run_job(self, job: tuple) -> None:
         action = job[0]
         self._cancel.clear()
@@ -183,8 +262,21 @@ class SftpWorker(QThread):
                 batch = job[4] if len(job) > 4 else 0
                 name = Path(remote_path).name or remote_path
 
-                def on_progress(done: int, total: int, label: str = name) -> None:
-                    self.progress.emit(f"下载 {label}", done, total)
+                # 先算总量，进度条才能显示有意义的百分比
+                total_files, total_bytes = (0, 0)
+
+                if is_dir:
+                    total_files, total_bytes = self._sftp.tree_size(remote_path)
+                else:
+                    try:
+                        total_bytes = max(0, self._sftp.stat_size(remote_path))
+                    except Exception:
+                        total_bytes = 0
+
+                tracker = self._make_tracker("下载", name, total_files, total_bytes)
+
+                def on_progress(done: int, total: int) -> None:
+                    tracker(done, total)
 
                 if is_dir:
                     files, size = self._sftp.download_tree(
@@ -193,6 +285,8 @@ class SftpWorker(QThread):
                         progress=on_progress,
                         cancelled=self._cancel.is_set,
                         resume=self.resume,
+                        on_file=tracker.file_started,
+                        counter=[0, total_files],
                     )
                     self.task_finished.emit("下载目录", True, f"{name}（{files} 个文件，{size} 字节）")
                 else:
@@ -216,8 +310,20 @@ class SftpWorker(QThread):
                 local_path, remote_path, is_dir = job[1], job[2], job[3]
                 batch = job[4] if len(job) > 4 else 0
 
-                def on_upload_progress(done: int, total: int, label: str = local_path.name) -> None:
-                    self.progress.emit(f"上传 {label}", done, total)
+                total_files, total_bytes = (0, 0)
+
+                if is_dir:
+                    total_files, total_bytes = _local_tree_size(local_path)
+                else:
+                    try:
+                        total_bytes = local_path.stat().st_size
+                    except OSError:
+                        total_bytes = 0
+
+                tracker = self._make_tracker("上传", local_path.name, total_files, total_bytes)
+
+                def on_upload_progress(done: int, total: int) -> None:
+                    tracker(done, total)
 
                 if is_dir:
                     files, size = self._sftp.upload_tree(
@@ -226,6 +332,7 @@ class SftpWorker(QThread):
                         progress=on_upload_progress,
                         cancelled=self._cancel.is_set,
                         resume=self.resume,
+                        on_file=tracker.file_started,
                     )
                     self.task_finished.emit("上传目录", True, f"{local_path.name}（{files} 个文件，{size} 字节）")
                 else:
