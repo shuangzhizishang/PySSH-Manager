@@ -142,6 +142,21 @@ class MainWindow(QMainWindow):
         self.action_split_v.setShortcut(QKeySequence("Ctrl+Shift+O"))
         self.action_split_v.triggered.connect(lambda: self.split_current(Qt.Orientation.Vertical))
 
+        # 两台主机并排（左侧选中两台 → 左边一台、右边另一台）
+        self.action_split_hosts_h = QAction("左右并排两台主机", self)
+        self.action_split_hosts_h.setShortcut(QKeySequence("Ctrl+Alt+E"))
+        self.action_split_hosts_h.setToolTip("把左侧选中的两台主机左右并排（左=第一台，右=第二台）")
+        self.action_split_hosts_h.triggered.connect(
+            lambda: self.split_two_selected_hosts(Qt.Orientation.Horizontal)
+        )
+
+        self.action_split_hosts_v = QAction("上下并排两台主机", self)
+        self.action_split_hosts_v.setShortcut(QKeySequence("Ctrl+Alt+O"))
+        self.action_split_hosts_v.setToolTip("把左侧选中的两台主机上下并排（上=第一台，下=第二台）")
+        self.action_split_hosts_v.triggered.connect(
+            lambda: self.split_two_selected_hosts(Qt.Orientation.Vertical)
+        )
+
         self.action_sync_input = QAction("同步输入到所有会话", self)
         self.action_sync_input.setShortcut(QKeySequence("Ctrl+Shift+B"))
         self.action_sync_input.setCheckable(True)
@@ -232,6 +247,8 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
         toolbar.addAction(self.action_split_h)
         toolbar.addAction(self.action_split_v)
+        toolbar.addAction(self.action_split_hosts_h)
+        toolbar.addAction(self.action_split_hosts_v)
         toolbar.addAction(self.action_focus_next)
         toolbar.addAction(self.action_sync_input)
         toolbar.addSeparator()
@@ -254,6 +271,8 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction(self.action_split_h)
         menu.addAction(self.action_split_v)
+        menu.addAction(self.action_split_hosts_h)
+        menu.addAction(self.action_split_hosts_v)
         menu.addAction(self.action_focus_next)
         menu.addAction(self.action_sync_input)
         menu.addSeparator()
@@ -399,6 +418,12 @@ class MainWindow(QMainWindow):
         menu.addAction("新会话（同一主机多条）", self.new_session_for_selected).setEnabled(single)
         menu.addAction(f"连接选中的 {len(hosts)} 台", self.connect_selected_hosts)
         menu.addSeparator()
+        # 分屏并排：选两台 → 一边一台（方便对比着配环境）
+        menu.addAction("左右并排（两台主机）", self.split_selected_hosts_h).setEnabled(len(hosts) >= 2)
+        menu.addAction("上下并排（两台主机）", self.split_selected_hosts_v).setEnabled(len(hosts) >= 2)
+        menu.addAction("并排到当前分屏（左右）", lambda: self.add_selected_host_to_split(Qt.Orientation.Horizontal)).setEnabled(single)
+        menu.addAction("并排到当前分屏（上下）", lambda: self.add_selected_host_to_split(Qt.Orientation.Vertical)).setEnabled(single)
+        menu.addSeparator()
         menu.addAction("编辑主机", self.edit_host).setEnabled(single)
         menu.addAction("SFTP 文件", self.open_sftp).setEnabled(single)
         menu.addAction("端口转发", self.open_forwards).setEnabled(single)
@@ -406,6 +431,22 @@ class MainWindow(QMainWindow):
         menu.addAction("断开选中会话", self.disconnect_selected_hosts)
         menu.addAction(f"删除选中的 {len(hosts)} 台", self.delete_selected_hosts)
         menu.exec(self.host_list.viewport().mapToGlobal(position))
+
+    def split_selected_hosts_h(self) -> None:
+        self.split_two_selected_hosts(Qt.Orientation.Horizontal)
+
+    def split_selected_hosts_v(self) -> None:
+        self.split_two_selected_hosts(Qt.Orientation.Vertical)
+
+    def add_selected_host_to_split(self, orientation: Qt.Orientation) -> None:
+        """把左侧选中的主机加到当前分屏里（右键菜单用）。"""
+
+        hosts = self._selected_hosts()
+
+        if not hosts:
+            return
+
+        self.add_host_to_current_split(hosts[0], orientation)
 
     def _on_host_selected(self, *_args) -> None:
         host = self._selected_host()
@@ -568,15 +609,23 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _tabs_for_host(self, host_id: str) -> list:
-        """该主机当前打开的所有终端标签（普通会话 / 分屏）。"""
+        """包含该主机会话的所有终端标签（普通会话 / 分屏）。
 
-        return [
-            self.tabs_widget.widget(row)
-            for row in range(self.tabs_widget.count())
-            if getattr(self.tabs_widget.widget(row), "host", None) is not None
-            and self.tabs_widget.widget(row).host.id == host_id
-            and isinstance(self.tabs_widget.widget(row), (SessionTab, SplitTerminalTab))
-        ]
+        分屏里的每个面板可以是不同主机，所以只要**任一**面板是该主机就算。
+        """
+
+        result = []
+
+        for row in range(self.tabs_widget.count()):
+            widget = self.tabs_widget.widget(row)
+
+            if isinstance(widget, SplitTerminalTab):
+                if any(pane.host is not None and pane.host.id == host_id for pane in widget.panes):
+                    result.append(widget)
+            elif isinstance(widget, SessionTab) and widget.host is not None and widget.host.id == host_id:
+                result.append(widget)
+
+        return result
 
     def _first_tab_for_host(self, host_id: str):
         tabs = self._tabs_for_host(host_id)
@@ -584,13 +633,13 @@ class MainWindow(QMainWindow):
         return tabs[0] if tabs else None
 
     def _session_count(self, host: Host) -> int:
-        """该主机的终端面板总数（分屏按面板数计）。"""
+        """该主机的终端面板总数（分屏只数属于该主机的面板）。"""
 
         count = 0
 
         for widget in self._tabs_for_host(host.id):
             if isinstance(widget, SplitTerminalTab):
-                count += max(1, len(widget.panes))
+                count += sum(1 for pane in widget.panes if pane.host is not None and pane.host.id == host.id)
             else:
                 count += 1
 
@@ -1097,8 +1146,161 @@ class MainWindow(QMainWindow):
         self.local_tabs[tab.host.id] = tab
         self._update_window_title()
 
-    def split_current(self, orientation: Qt.Orientation) -> None:
-        """把当前终端标签拆成两个面板（各自独立连接）。"""
+    def _register_split_tab(self, split: SplitTerminalTab, title: str = "") -> int:
+        """把分屏容器登记成标签：连信号、加标签、刷新标题/计数/同步标识。"""
+
+        for host in split.hosts:
+            split.title_changed.connect(lambda text, h=host: self._on_title(h, text))
+            split.failed.connect(lambda message, h=host: self._on_session_error(h, message))
+            self.context.hosts.mark_connected(host.id)
+
+        split.pane_input.connect(self._on_pane_input)
+        split.panes_changed.connect(lambda s=split: self._on_split_panes_changed(s))
+
+        index = self.tabs_widget.addTab(split, title or split.display_name)
+        self.tabs_widget.setTabToolTip(index, " ⇄ ".join(host.target for host in split.hosts))
+        self.tabs_widget.setCurrentIndex(index)
+
+        for host in split.hosts:
+            self._refresh_tab_title(host)
+
+        self.refresh_hosts()
+        self._update_window_title()
+        self._sync_command_actions()
+        self.set_sync_input(self.sync_input)
+
+        return index
+
+    def _on_split_panes_changed(self, split: SplitTerminalTab) -> None:
+        """分屏里的面板变化（加了别的主机等）→ 刷新标签标题与侧边栏计数。"""
+
+        for host in split.hosts:
+            self._refresh_tab_title(host)
+
+        index = self.tabs_widget.indexOf(split)
+
+        if index >= 0:
+            self.tabs_widget.setTabToolTip(index, " ⇄ ".join(host.target for host in split.hosts))
+
+        self.refresh_hosts()
+        self._update_window_title()
+
+    def open_split_hosts(self, first: Host, second: Host, orientation: Qt.Orientation) -> None:
+        """把两台主机摆在同一个标签里（左/上 = first，右/下 = second）。
+
+        这样左边 192.168.206.130、右边 192.168.206.131 可以对比着配环境；
+        配合「同步输入」还能两边一起执行同一条命令。
+        """
+
+        if first.id == second.id:
+            self.connect_host(first, force_new=True)
+            return
+
+        first_credential = self._ensure_credential(first)
+        second_credential = self._ensure_credential(second)
+
+        if first_credential is None or second_credential is None:
+            return
+
+        first_jump = self._jump_client_for(first)
+        second_jump = self._jump_client_for(second)
+        existing = self._first_tab_for_host(first.id)
+
+        # 已经有一个包含 first 的分屏：把 second 塞进去（若有空位）
+        if isinstance(existing, SplitTerminalTab):
+            self.tabs_widget.setCurrentWidget(existing)
+
+            if existing.pane_for_host(second.id) is not None:
+                self.statusBar().showMessage("这两台主机已经在同一个分屏里了")
+                return
+
+            pane = existing.add_pane(host=second, credential=second_credential, jump=second_jump)
+            existing.splitter.setOrientation(orientation)
+
+            self.statusBar().showMessage(
+                f"已把 {second.display_name} 加入分屏" if pane is not None
+                else f"分屏已满（最多 {SplitTerminalTab.MAX_PANES} 个面板），请先关掉一个"
+            )
+            return
+
+        reuse = isinstance(existing, SessionTab)
+        split = SplitTerminalTab(
+            first,
+            credential=first_credential,
+            jump=first_jump,
+            orientation=orientation,
+            parent=self,
+            first_pane=not reuse,
+        )
+
+        if reuse:
+            # 复用已经打开的 first 会话，省一条连接
+            existing.setVisible(False)
+            split.splitter.insertWidget(0, existing)
+            existing.setVisible(True)
+            self.tabs_widget.removeTab(self.tabs_widget.indexOf(existing))
+            existing.input_generated.connect(lambda data, t=existing: self._on_pane_input(t, data))
+
+        split.add_pane(host=second, credential=second_credential, jump=second_jump, activate=True)
+        self._register_split_tab(split, f"{first.display_name} ⇄ {second.display_name}")
+        self.statusBar().showMessage(
+            f"已{'左右' if orientation == Qt.Orientation.Horizontal else '上下'}并排："
+            f"{first.display_name} ⇄ {second.display_name}"
+        )
+
+    def split_two_selected_hosts(self, orientation: Qt.Orientation) -> None:
+        """把左侧选中的两台主机并排打开（左右或上下）。"""
+
+        hosts = self._selected_hosts()
+
+        if len(hosts) < 2:
+            self.statusBar().showMessage("请先在左侧选中两台主机（按住 Ctrl 可多选），再并排打开")
+            return
+
+        self.open_split_hosts(hosts[0], hosts[1], orientation)
+
+    def add_host_to_current_split(self, host: Host, orientation: Qt.Orientation) -> None:
+        """把某台主机加进当前分屏（右键菜单用）。"""
+
+        widget = self.tabs_widget.currentWidget()
+
+        if isinstance(widget, SplitTerminalTab):
+            if widget.pane_for_host(host.id) is not None:
+                pane = widget.pane_for_host(host.id)
+
+                if pane is not None:
+                    pane.view.setFocus()
+
+                self.statusBar().showMessage(f"{host.display_name} 已经在该分屏里")
+                return
+
+            credential = self._ensure_credential(host)
+
+            if credential is None:
+                return
+
+            pane = widget.add_pane(host=host, credential=credential, jump=self._jump_client_for(host))
+            widget.splitter.setOrientation(orientation)
+
+            self.statusBar().showMessage(
+                f"已把 {host.display_name} 加入分屏" if pane is not None
+                else f"分屏已满（最多 {SplitTerminalTab.MAX_PANES} 个面板）"
+            )
+            return
+
+        if isinstance(widget, SessionTab) and widget.host is not None and widget.host.id != host.id:
+            # 当前会话 + 这台主机并排
+            self.open_split_hosts(widget.host, host, orientation)
+            return
+
+        self.connect_host(host, force_new=True)
+
+    def split_current(self, orientation: Qt.Orientation, second_host: Host | None = None) -> None:
+        """把当前终端标签拆成两个面板（各自独立连接）。
+
+        ``second_host`` 传入另一台主机时，右侧/下方面板连那台主机
+        （即"左边一台虚拟机、右边另一台"）。
+        """
 
         widget = self.tabs_widget.currentWidget()
 
@@ -1107,6 +1309,25 @@ class MainWindow(QMainWindow):
             return
 
         if isinstance(widget, SplitTerminalTab):
+            if second_host is not None and widget.pane_for_host(second_host.id) is None:
+                credential = self._ensure_credential(second_host)
+
+                if credential is None:
+                    return
+
+                pane = widget.add_pane(
+                    host=second_host,
+                    credential=credential,
+                    jump=self._jump_client_for(second_host),
+                )
+                widget.splitter.setOrientation(orientation)
+
+                self.statusBar().showMessage(
+                    f"已把 {second_host.display_name} 加入分屏" if pane is not None
+                    else f"分屏已满（最多 {SplitTerminalTab.MAX_PANES} 个面板）"
+                )
+                return
+
             before = widget.orientation
             pane = widget.split(orientation)
 
@@ -1131,30 +1352,44 @@ class MainWindow(QMainWindow):
             return
 
         host = widget.host
+        second_credential = None
+
+        if second_host is not None and second_host.id != host.id:
+            second_credential = self._ensure_credential(second_host)
+
+            if second_credential is None:
+                return
+
         index = self.tabs_widget.indexOf(widget)
         title = self.tabs_widget.tabText(index)
 
         # 复用原有面板，避免白建一条连接；先隐藏再换父控件，防止 Qt 布局递归
         widget.setVisible(False)
-        split = SplitTerminalTab(host, credential=widget.credential, jump=widget.jump, orientation=orientation, parent=self)
+        split = SplitTerminalTab(
+            host,
+            credential=widget.credential,
+            jump=widget.jump,
+            orientation=orientation,
+            parent=self,
+            first_pane=False,
+        )
         split.splitter.insertWidget(0, widget)
         widget.setVisible(True)
         self.tabs_widget.removeTab(index)
-
-        split.title_changed.connect(lambda text, h=host: self._on_title(h, text))
-        split.failed.connect(lambda message, h=host: self._on_session_error(h, message))
-        split.pane_input.connect(self._on_pane_input)
         widget.input_generated.connect(lambda data, t=widget: self._on_pane_input(t, data))
 
-        new_index = self.tabs_widget.addTab(split, title or host.display_name)
-        self.tabs_widget.setTabToolTip(new_index, host.target)
-        self.tabs_widget.setCurrentIndex(new_index)
+        if second_host is not None and second_host.id != host.id:
+            split.add_pane(
+                host=second_host,
+                credential=second_credential,
+                jump=self._jump_client_for(second_host),
+                activate=True,
+            )
+            title = f"{host.display_name} ⇄ {second_host.display_name}"
+        else:
+            split.add_pane(host=host, credential=widget.credential, jump=widget.jump, activate=True)
 
-        split.add_pane(activate=True)
-        self._refresh_tab_title(host)
-        self._update_window_title()
-        self._sync_command_actions()
-        self.set_sync_input(self.sync_input)  # 新面板也要带上同步标识
+        self._register_split_tab(split, title)
 
     def focus_next_pane(self) -> None:
         widget = self.tabs_widget.currentWidget()
@@ -1424,14 +1659,17 @@ class MainWindow(QMainWindow):
         self._update_window_title()
 
     def _refresh_tab_title_by_title(self, host: Host) -> None:
-        """按"远端标题优先"的规则刷新标签文字，并保留多会话序号。"""
+        """按"远端标题优先"的规则刷新标签文字，并保留多会话序号。
+
+        每个标签用**它自己**的 ``display_name``：分屏容器在两台不同主机时是
+        「A ⇄ B」，不会被某一侧的远端 OSC 标题覆盖掉。
+        """
 
         tabs = self._tabs_for_host(host.id)
 
         if not tabs:
             return
 
-        base = getattr(tabs[0], "remote_title", "") or (host.display_name)
         ordinal = 0
 
         for widget in tabs:
@@ -1439,6 +1677,8 @@ class MainWindow(QMainWindow):
 
             if index < 0:
                 continue
+
+            base = getattr(widget, "display_name", "") or getattr(widget, "remote_title", "") or host.display_name
 
             if isinstance(widget, SplitTerminalTab):
                 ordinal += 1

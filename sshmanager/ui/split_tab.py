@@ -15,7 +15,11 @@ from .session_tab import SessionTab
 
 
 class SplitTerminalTab(QWidget):
-    """把一个主机拆成多个并排/堆叠的终端面板。"""
+    """把多个终端面板并排/堆叠在同一个标签里。
+
+    每个面板可以有**自己的主机**（例如左边 192.168.206.130、右边 192.168.206.131），
+    这样能把多台虚拟机摆在一起对比着配环境；也可以两个面板连同一台主机。
+    """
 
     title_changed = Signal(str)
     closed = Signal()
@@ -23,6 +27,9 @@ class SplitTerminalTab(QWidget):
 
     #: 某个面板产生了输入（面板, 数据），主窗口据此做同步广播
     pane_input = Signal(object, object)
+
+    #: 面板集合变化（新增/关闭/换了主机）→ 主窗口刷新标签标题与侧边栏计数
+    panes_changed = Signal()
 
     #: 最多两个面板（左右或上下各两个；再多屏幕太挤，且会话数翻倍不好管）
     MAX_PANES = 2
@@ -34,9 +41,11 @@ class SplitTerminalTab(QWidget):
         jump: SSHClient | None = None,
         orientation: Qt.Orientation = Qt.Orientation.Horizontal,
         parent=None,
+        first_pane: bool = True,
     ) -> None:
         super().__init__(parent)
 
+        #: 第一个面板的主机（也代表"这个标签属于哪台主机"）
         self.host = host
         self.credential = credential
         self.jump = jump
@@ -51,13 +60,55 @@ class SplitTerminalTab(QWidget):
         layout.setSpacing(0)
         layout.addWidget(self.splitter)
 
-        self.add_pane(activate=False)
+        if first_pane:
+            self.add_pane(host=host, credential=credential, jump=jump, activate=False)
 
     # ------------------------------------------------------------------
 
     @property
     def display_name(self) -> str:
-        return self.host.display_name
+        """标签名：两个面板是不同主机时显示成 「A ⇄ B」。
+
+        多主机时不采用远端 OSC 标题——否则标题会被某一侧覆盖成 `root@xxx:~`，
+        看不出这一栏到底是哪台虚拟机。
+        """
+
+        panes = self.panes
+        same_host = len({pane.host.id for pane in panes if pane.host is not None}) <= 1
+        names: list[str] = []
+
+        for pane in panes:
+            name = pane.host.display_name if pane.host is not None else "本地"
+
+            if same_host:
+                name = getattr(pane, "remote_title", "") or name
+
+            if name not in names:
+                names.append(name)
+
+        if not names:
+            return "分屏"
+
+        return " ⇄ ".join(names) if len(names) > 1 else names[0]
+
+    @property
+    def hosts(self) -> list[Host]:
+        """本标签里出现的所有主机（去重，保持面板顺序）。"""
+
+        result: list[Host] = []
+
+        for pane in self.panes:
+            if pane.host is not None and all(item.id != pane.host.id for item in result):
+                result.append(pane.host)
+
+        return result
+
+    def pane_for_host(self, host_id: str):
+        for pane in self.panes:
+            if pane.host is not None and pane.host.id == host_id:
+                return pane
+
+        return None
 
     @property
     def panes(self) -> list[SessionTab]:
@@ -85,11 +136,27 @@ class SplitTerminalTab(QWidget):
 
     # ------------------------------------------------------------------
 
-    def add_pane(self, activate: bool = True) -> SessionTab | None:
+    def add_pane(
+        self,
+        host: Host | None = None,
+        credential: str | None = None,
+        jump: SSHClient | None = None,
+        activate: bool = True,
+    ) -> SessionTab | None:
+        """新增一个面板；``host`` 不传就沿用本标签的主机。
+
+        传入别的主机即可实现"左边一台、右边另一台"的分屏。
+        """
+
         if len(self.panes) >= self.MAX_PANES:
             return None
 
-        pane = SessionTab(self.host, credential=self.credential, jump=self.jump)
+        pane_host = host if host is not None else self.host
+        pane = SessionTab(
+            pane_host,
+            credential=credential if credential is not None else self.credential,
+            jump=jump if jump is not None else self.jump,
+        )
         pane.title_changed.connect(self._on_pane_title)
         pane.failed.connect(self.failed)
         pane.closed.connect(lambda p=pane: self._on_pane_closed(p))
@@ -102,6 +169,8 @@ class SplitTerminalTab(QWidget):
 
         if activate:
             pane.view.setFocus()
+
+        self.panes_changed.emit()
 
         return pane
 
@@ -117,7 +186,6 @@ class SplitTerminalTab(QWidget):
                 self.splitter.setOrientation(orientation)
 
             return self.add_pane(activate=True)
-
         # 已到上限：允许切换排列方向，但绝不新增面板
         if self.splitter.orientation() != orientation:
             self.splitter.setOrientation(orientation)

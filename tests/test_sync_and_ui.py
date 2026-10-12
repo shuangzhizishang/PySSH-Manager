@@ -151,6 +151,92 @@ def test_split_stops_at_limit(tabs):
 
 
 # ----------------------------------------------------------------------
+# 双主机分屏（左边一台虚拟机、右边另一台）
+# ----------------------------------------------------------------------
+
+def test_split_tab_accepts_different_hosts_per_pane():
+    _application()
+
+    from sshmanager.hosts import Host
+
+    left = Host(label="left", hostname="10.0.0.1", username="root")
+    right = Host(label="right", hostname="10.0.0.2", username="root")
+
+    split = SplitTerminalTab(left, first_pane=False)
+    split.add_pane(host=left, activate=False)
+    split.add_pane(host=right, activate=False)
+
+    try:
+        assert len(split.panes) == 2
+        assert split.panes[0].host.id == left.id
+        assert split.panes[1].host.id == right.id
+        assert [host.id for host in split.hosts] == [left.id, right.id]
+        assert split.pane_for_host(right.id) is split.panes[1]
+        # 两台不同主机 → 标题显示成 A ⇄ B，而不是某一侧的远端标题
+        assert split.display_name == "left ⇄ right"
+    finally:
+        split.close()
+
+
+def test_display_name_uses_remote_title_only_for_same_host():
+    _application()
+
+    from sshmanager.hosts import Host
+
+    host = Host(label="same", hostname="10.0.0.9", username="root")
+    split = SplitTerminalTab(host, first_pane=False)
+    split.add_pane(host=host, activate=False)
+    split.add_pane(host=host, activate=False)
+
+    try:
+        assert len(split.panes) == 2
+        split.panes[0].remote_title = "root@same:~"
+        split.panes[1].remote_title = "root@same:~"
+        assert split.display_name == "root@same:~", "同一台主机时用远端标题更直观"
+    finally:
+        split.close()
+
+
+def test_open_split_hosts_puts_two_hosts_side_by_side():
+    """主窗口入口：两台主机 → 一个标签两个面板，各自连不同主机。"""
+
+    from sshmanager.credentials import CredentialStore
+    from sshmanager.hosts import Host, HostStore
+    from sshmanager.ui import AppContext, MainWindow
+
+    from PySide6.QtCore import Qt
+
+    _application()
+
+    hosts = HostStore()
+    credentials = CredentialStore()
+    context = AppContext(hosts=hosts, credentials=credentials)
+
+    left = Host(label="left", hostname="127.0.0.1", port=1, username="root")
+    right = Host(label="right", hostname="127.0.0.2", port=1, username="root")
+    hosts.add(left)
+    hosts.add(right)
+    credentials.set(left.id, "x")
+    credentials.set(right.id, "x")
+
+    window = MainWindow(context)
+    window.open_split_hosts(left, right, Qt.Orientation.Horizontal)
+    _application().processEvents()
+
+    try:
+        split = window.tabs_widget.currentWidget()
+        assert isinstance(split, SplitTerminalTab)
+        assert [pane.host.id for pane in split.panes] == [left.id, right.id]
+        assert split.splitter.orientation() == Qt.Orientation.Horizontal
+        assert window.tabs_widget.count() == 1
+
+        title = window.tabs_widget.tabText(window.tabs_widget.currentIndex())
+        assert "left" in title and "right" in title, f"标题应体现两台主机：{title}"
+    finally:
+        window.shutdown()
+
+
+# ----------------------------------------------------------------------
 # 目录过滤
 # ----------------------------------------------------------------------
 
