@@ -71,6 +71,16 @@ class TerminalTab(QWidget):
     closed = Signal()
     failed = Signal(str)
 
+    #: 用户在本终端产生了输入（键盘/粘贴/命令库都算）。主窗口据此做"同步输入"广播。
+    input_generated = Signal(bytes)
+
+    #: 输出合并窗口：每 16ms（约 60fps）处理一次，刷屏时界面仍可响应
+    OUTPUT_INTERVAL_MS = 16
+
+    #: 单次最多处理多少字节：pyte 解析约 0.2MB/s，一次处理太多会让界面停顿数秒；
+    #: 限制在 32KB（约 0.15 秒）就能保证"刷屏时点界面依然有反应"。
+    OUTPUT_FLUSH_BYTES = 32 * 1024
+
     def __init__(
         self,
         host: Host | None = None,
@@ -91,6 +101,12 @@ class TerminalTab(QWidget):
         self.recorder = None
         #: 远端通过 OSC 序列设置的标题（优先用于标签名）
         self.remote_title = ""
+
+        # 输出合并缓冲（见 _on_output）
+        self._pending_output = bytearray()
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setSingleShot(True)
+        self._flush_timer.timeout.connect(self._flush_output)
 
         self.view = TerminalView()
         self.view.data_to_send.connect(self._on_input)
@@ -218,15 +234,48 @@ class TerminalTab(QWidget):
         QTimer.singleShot(0, self.view.setFocus)
 
     def _on_output(self, data: bytes) -> None:
-        """服务器输出：喂给终端 +（可选）写入录制。"""
+        """服务器输出：喂给终端 +（可选）写入录制。
 
-        self.view.feed(data)
+        输出先攒进缓冲区，**每帧只解析/重绘一次**：远端刷屏（yum/docker 下载）
+        时每个网络分片都触发一次 pyte 解析 + 整屏重绘，会把界面线程占满，
+        表现为"点什么都没反应"。
+        """
 
         if self.recorder is not None and self.recorder.active:
             try:
                 self.recorder.write_output(data)
             except Exception:
                 pass
+
+        if not data:
+            return
+
+        self._pending_output += data
+
+        # 攒够一批就立刻处理（每次只取一批，剩下的留给下一帧）
+        if len(self._pending_output) >= self.OUTPUT_FLUSH_BYTES:
+            self._flush_output()
+            return
+
+        if not self._flush_timer.isActive():
+            self._flush_timer.start(self.OUTPUT_INTERVAL_MS)
+
+    def _flush_output(self) -> None:
+        """把攒下的输出交给终端；一次最多处理 OUTPUT_FLUSH_BYTES，剩下的下一帧继续。"""
+
+        self._flush_timer.stop()
+
+        if not self._pending_output:
+            return
+
+        limit = self.OUTPUT_FLUSH_BYTES
+        payload = bytes(self._pending_output[:limit])
+        del self._pending_output[:limit]
+        self.view.feed(payload)
+
+        # 还有积压就继续安排下一帧，避免解析把界面线程整段占住
+        if self._pending_output:
+            self._flush_timer.start(self.OUTPUT_INTERVAL_MS)
 
     # ------------------------------------------------------------------
     # 会话录制
@@ -321,6 +370,7 @@ class TerminalTab(QWidget):
 
     def close(self) -> None:
         self._closing = True
+        self._flush_output()
         self.stop_recording()
         self._stop_session()
 
@@ -330,6 +380,24 @@ class TerminalTab(QWidget):
         if self.session is not None:
             self.session.send(data)
 
+        if self.recorder is not None and self.recorder.active:
+            try:
+                self.recorder.write_input(data)
+            except Exception:
+                pass
+
+        # 通知主窗口：本终端产生了输入（"同步输入"时广播给其它会话）
+        self.input_generated.emit(data)
+
+    def write_input(self, data: bytes) -> None:
+        """只把数据写进会话，不再触发 input_generated（供同步广播使用，避免回环）。"""
+
+        if not data or self.session is None:
+            return
+
+        self.session.send(data)
+
+        # 广播出去的输入同样记进录制，回放时才是完整的一条时间线
         if self.recorder is not None and self.recorder.active:
             try:
                 self.recorder.write_input(data)
@@ -408,6 +476,12 @@ class SessionTab(TerminalTab):
         # 复制/粘贴等操作的即时反馈
         self._copy_hint = lambda text: self.status.setText(text)
 
+        # 同步输入标识（开启广播时显示，提醒输入会发往多个会话）
+        self.sync_label = QLabel("⇄ 同步输入")
+        self.sync_label.setStyleSheet("color: #d29922; padding: 2px 8px;")
+        self.sync_label.setToolTip("本终端的输入会同时发送到其它已打开的 SSH 会话")
+        self.sync_label.setVisible(False)
+
         self.target = QLabel(self._target_text())
         self.target.setStyleSheet("color: #8b949e; padding: 2px 8px;")
 
@@ -417,10 +491,16 @@ class SessionTab(TerminalTab):
         row = QHBoxLayout(bar)
         row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(self.status)
+        row.addWidget(self.sync_label)
         row.addStretch()
         row.addWidget(self.target)
 
         self._layout.insertWidget(0, bar)
+
+    def set_sync_badge(self, visible: bool) -> None:
+        """显示/隐藏状态栏上的「同步输入」标记。"""
+
+        self.sync_label.setVisible(bool(visible))
 
     def _target_text(self) -> str:
         if self.host is None:

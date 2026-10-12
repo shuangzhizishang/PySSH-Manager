@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
@@ -9,6 +10,13 @@ from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetricsF, QGuiAppli
 from PySide6.QtWidgets import QAbstractScrollArea
 
 from .core import KEY_SEQUENCES, CellStyle, Emulator, ctrl_byte
+from ..settings import trace_ui
+
+
+def _trace_enabled() -> bool:
+    import os
+
+    return os.environ.get("PYSSH_TRACE_UI", "").strip() in ("1", "true", "True", "yes")
 
 # ----------------------------------------------------------------------
 # 配色
@@ -76,6 +84,14 @@ class TerminalView(QAbstractScrollArea):
         #: 鼠标松开时自动把选中内容复制到 Windows 剪贴板（PuTTY 风格）
         self.select_to_copy = True
 
+        # 绘制缓存：颜色与字体按样式键复用，避免每格新建 QColor/QFont
+        self._color_cache: dict[str, QColor] = {}
+        self._font_cache: dict[tuple, QFont] = {}
+
+        # 历史行列表快照（deque 按下标取值很慢，见 _history_list）
+        self._history_snapshot: list = []
+        self._history_len = -1
+
         # 回滚：offset 表示视口相对「虚拟轴末尾」向上偏移的行数
         self._offset = 0
         self._last_total = self.emulator.lines
@@ -135,11 +151,13 @@ class TerminalView(QAbstractScrollArea):
     def apply_font(self, family: str | None, size: int) -> None:
         self._font = self._pick_font(family, size)
         self._cell = self._measure(self._font)
+        self._font_cache.clear()
         self._update_size_hint()
         self.viewport().update()
 
     def apply_theme(self, theme: dict) -> None:
         self._theme.update(theme)
+        self._cleared_caches()
         self.viewport().update()
 
     def focusInEvent(self, event):  # noqa: N802 - Qt 命名
@@ -157,8 +175,12 @@ class TerminalView(QAbstractScrollArea):
     def feed(self, data: bytes | str) -> None:
         """喂入服务器输出。"""
 
+        trace = _trace_enabled()
+        started = time.perf_counter() if trace else 0.0
+
         self.emulator.feed(data)
 
+        parsed = time.perf_counter() if trace else 0.0
         title = self.emulator.title
 
         if title != self._last_title:
@@ -167,6 +189,18 @@ class TerminalView(QAbstractScrollArea):
 
         self._track_output()
         self.viewport().update()
+
+        if trace:
+            total = time.perf_counter() - started
+            parse = parsed - started
+            scroll = time.perf_counter() - parsed
+
+            # 只报"明显拖慢界面"的调用
+            if total > 0.05:
+                trace_ui(
+                    f"feed {len(data)}B：解析 {parse * 1000:.0f}ms，滚动 {scroll * 1000:.0f}ms，"
+                    f"合计 {total * 1000:.0f}ms"
+                )
 
     def resizeEvent(self, event):  # noqa: N802
         super().resizeEvent(event)
@@ -217,6 +251,23 @@ class TerminalView(QAbstractScrollArea):
     @property
     def _history_top(self):
         return self.emulator.screen.history.top
+
+    def _history_list(self) -> list:
+        """历史行列表快照。
+
+        pyte 的 history.top 是 deque，**按下标访问是 O(n)**；历史几千行时
+        每帧绘制都要按行号取值，会把重绘拖慢十几倍。这里缓存成 list，
+        只在长度变化时重建一次。
+        """
+
+        top = self._history_top
+        length = len(top)
+
+        if length != self._history_len:
+            self._history_snapshot = list(top)
+            self._history_len = length
+
+        return self._history_snapshot
 
     @property
     def _history_bottom(self):
@@ -306,7 +357,7 @@ class TerminalView(QAbstractScrollArea):
     def _history_line(self, index: int):
         """历史行（top 之后接 bottom），越界返回 None。"""
 
-        top = self._history_top
+        top = self._history_list()
 
         if 0 <= index < len(top):
             return top[index]
@@ -323,7 +374,7 @@ class TerminalView(QAbstractScrollArea):
         """虚拟行上的纯文本（越界返回空串）。"""
 
         columns = self.emulator.columns
-        top = self._history_top
+        top = self._history_list()
 
         if 0 <= virtual < len(top):
             line = top[virtual]
@@ -351,7 +402,7 @@ class TerminalView(QAbstractScrollArea):
         if not (0 <= column < self.emulator.columns):
             return None
 
-        top = self._history_top
+        top = self._history_list()
         screen_start = len(top)
 
         if virtual < screen_start:
@@ -415,41 +466,147 @@ class TerminalView(QAbstractScrollArea):
     # ------------------------------------------------------------------
 
     def _resolve_color(self, name: str) -> QColor:
+        cached = self._color_cache.get(name)
+
+        if cached is not None:
+            return cached
+
         theme = self._theme
+        color = None
 
         if name in theme:
-            return QColor(theme[name])
+            color = QColor(theme[name])
+        elif name.startswith("#") and len(name) in (4, 7):
+            color = QColor(name)
+        else:
+            palette = {
+                "black": "black",
+                "red": "red",
+                "green": "green",
+                "brown": "yellow",
+                "blue": "blue",
+                "magenta": "magenta",
+                "cyan": "cyan",
+                "white": "white",
+            }
 
-        if name.startswith("#") and len(name) in (4, 7):
-            return QColor(name)
+            if name in palette:
+                color = QColor(palette[name])
+            elif name.startswith("bright") and name[6:] in palette:
+                color = QColor(palette[name[6:]]).lighter(125)
 
-        palette = {
-            "black": "black",
-            "red": "red",
-            "green": "green",
-            "brown": "yellow",
-            "blue": "blue",
-            "magenta": "magenta",
-            "cyan": "cyan",
-            "white": "white",
-        }
+        if color is None:
+            color = QColor(theme["foreground"])
 
-        if name in palette:
-            return QColor(palette[name])
+        self._color_cache[name] = color
 
-        if name.startswith("bright") and name[6:] in palette:
-            return QColor(palette[name[6:]]).lighter(125)
+        return color
 
-        if name in ("default", ""):
-            return QColor(theme["foreground"])
+    def _cleared_caches(self) -> None:
+        """字体/颜色/主题变化后清缓存。"""
 
-        return QColor(theme["foreground"])
+        self._color_cache.clear()
+        self._font_cache.clear()
+
+    def _font_for_key(self, key: tuple) -> QFont:
+        """按样式键取字体（缓存，避免每格新建 QFont）。"""
+
+        font = self._font_cache.get(key)
+
+        if font is not None:
+            return font
+
+        _, _, bold, italics, underscore, strikethrough, _ = key
+        font = QFont(self._font)
+        font.setBold(bool(bold))
+        font.setItalic(bool(italics))
+        font.setUnderline(bool(underscore))
+        font.setStrikeOut(bool(strikethrough))
+        self._font_cache[key] = font
+
+        return font
+
+    def _color_for_key(self, key: tuple) -> QColor:
+        fg, bg, _, _, _, _, reverse = key
+
+        return self._resolve_color(bg if reverse else fg)
 
     # ------------------------------------------------------------------
     # 绘制
     # ------------------------------------------------------------------
 
+    def _raw_line(self, virtual: int):
+        """虚拟行对应的 pyte 行对象（只含写入过的单元格）；越界返回 None。"""
+
+        top = self._history_list()
+
+        if 0 <= virtual < len(top):
+            return top[virtual]
+
+        screen_start = len(top)
+
+        if screen_start <= virtual < screen_start + self.emulator.lines:
+            return self.emulator.screen.buffer.get(virtual - screen_start)
+
+        return self._history_line(virtual)
+
+    @staticmethod
+    def _style_key(char) -> tuple:
+        """样式键：同样式键的连续单元格可以合并成一次 drawText。"""
+
+        return (
+            char.fg,
+            char.bg,
+            bool(char.bold),
+            bool(char.italics),
+            bool(char.underscore),
+            bool(char.strikethrough),
+            bool(char.reverse),
+        )
+
+    def _paint_line(self, painter, line, top: int, baseline: int, cell_width: int, cell_height: int) -> None:
+        """画一行：先铺该行有背景色的格子，再按同样式合并文本片段。
+
+        只遍历"写入过的单元格"（pyte 的行是稀疏字典），刷屏时比逐列扫描快很多。
+        """
+
+        runs: list[list] = []
+        current = None
+
+        for column, char in line.items():
+            key = self._style_key(char)
+
+            # 背景色（含反显：反显时用前景色铺底）
+            if char.reverse or char.bg not in ("default", ""):
+                painter.fillRect(
+                    QRect(column * cell_width, top, cell_width, cell_height),
+                    self._resolve_color(char.fg if char.reverse else char.bg),
+                )
+
+            # 纯空格且无背景：不必画字
+            if char.data == " " and char.bg in ("default", "") and not char.reverse:
+                continue
+
+            if current is not None and current[0] == key and current[1] + len(current[2]) == column:
+                current[2] += char.data
+            else:
+                if current is not None:
+                    runs.append(current)
+
+                current = [key, column, char.data]
+
+        if current is not None:
+            runs.append(current)
+
+        for key, column, text in runs:
+            painter.setFont(self._font_for_key(key))
+            painter.setPen(self._color_for_key(key))
+            painter.drawText(column * cell_width, baseline, text)
+
     def paintEvent(self, event):  # noqa: N802
+        trace = _trace_enabled()
+        paint_started = time.perf_counter() if trace else 0.0
+
         painter = QPainter(self.viewport())
         painter.setFont(self._font)
 
@@ -478,28 +635,24 @@ class TerminalView(QAbstractScrollArea):
 
         selection = self._selection_range()
 
-        # 底色层：铺每个单元的 ANSI 背景色
+        # 底色层与文本层：只遍历"实际写入过的单元格"，并按同一样式合并成片段绘制
         for view_row, virtual in visible:
             top = view_row * cell_height
+            line = self._raw_line(virtual)
 
-            for column in range(columns):
-                cell = self._cell_at_virtual(virtual, column)
-                background = None
+            if not line:
+                continue
 
-                if cell is not None:
-                    style = cell[1]
+            self._paint_line(
+                painter,
+                line,
+                top=top,
+                baseline=top + baseline,
+                cell_width=cell_width,
+                cell_height=cell_height,
+            )
 
-                    if style.bg not in ("default", ""):
-                        background = self._resolve_color(style.bg)
-
-                    if style.reverse:
-                        background = self._resolve_color(style.fg)
-
-                if background is not None:
-                    painter.fillRect(
-                        QRect(column * cell_width, top, cell_width, cell_height),
-                        background,
-                    )
+        painter.setFont(self._font)
 
         # 选区（选区记的是虚拟行号，滚动时跟着内容走）
         if selection:
@@ -527,28 +680,6 @@ class TerminalView(QAbstractScrollArea):
                     QColor(self._theme["selection"]),
                 )
 
-        # 文本层
-        for view_row, virtual in visible:
-            top = view_row * cell_height
-            y = top + baseline
-
-            for column in range(columns):
-                cell = self._cell_at_virtual(virtual, column)
-
-                if cell is None:
-                    continue
-
-                char, style = cell
-
-                if char == " " and style.bg in ("default", "") and not style.reverse:
-                    continue
-
-                color = self._resolve_color(style.bg if style.reverse else style.fg)
-
-                painter.setFont(self._styled_font(style))
-                painter.setPen(color)
-                painter.drawText(column * cell_width, y, char)
-
         painter.setFont(self._font)
 
         # 光标（只在贴底时显示）
@@ -572,6 +703,12 @@ class TerminalView(QAbstractScrollArea):
                     painter.drawText(cursor.x * cell_width, cursor_top + baseline, cell[0])
 
         painter.end()
+
+        if trace:
+            elapsed = time.perf_counter() - paint_started
+
+            if elapsed > 0.05:
+                trace_ui(f"paint {view_rows} 行：{elapsed * 1000:.0f}ms")
 
     def _styled_font(self, style: CellStyle) -> QFont:
         font = QFont(self._font)

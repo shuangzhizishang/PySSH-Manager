@@ -76,6 +76,8 @@ class MainWindow(QMainWindow):
         self.context = context
         #: 说明：终端标签统一从 tabs_widget 现算（见 _all_host_tabs / _tabs_for_host），
         #: 不再维护单独的登记表——曾经两者不同步导致退出时漏关会话。
+        self.sync_input = False
+        self._sync_flash = 0
         self.sftp_tabs: dict[str, SftpPanel] = {}
         self.local_tabs: dict[str, LocalTerminalTab] = {}
         self.replay_dialog = None
@@ -139,6 +141,15 @@ class MainWindow(QMainWindow):
         self.action_split_v = QAction("上下分屏", self)
         self.action_split_v.setShortcut(QKeySequence("Ctrl+Shift+O"))
         self.action_split_v.triggered.connect(lambda: self.split_current(Qt.Orientation.Vertical))
+
+        self.action_sync_input = QAction("同步输入到所有会话", self)
+        self.action_sync_input.setShortcut(QKeySequence("Ctrl+Shift+B"))
+        self.action_sync_input.setCheckable(True)
+        self.action_sync_input.setToolTip(
+            "开启后，在当前终端输入的命令会同时发送到其它已打开的 SSH 会话\n"
+            "（批量配环境用；危险命令会一起执行，注意确认）"
+        )
+        self.action_sync_input.toggled.connect(self.set_sync_input)
 
         self.action_focus_next = QAction("切换分屏焦点", self)
         self.action_focus_next.setShortcut(QKeySequence("Ctrl+Shift+W"))
@@ -222,6 +233,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.action_split_h)
         toolbar.addAction(self.action_split_v)
         toolbar.addAction(self.action_focus_next)
+        toolbar.addAction(self.action_sync_input)
         toolbar.addSeparator()
         toolbar.addAction(self.action_new)
         toolbar.addAction(self.action_edit)
@@ -243,6 +255,7 @@ class MainWindow(QMainWindow):
         menu.addAction(self.action_split_h)
         menu.addAction(self.action_split_v)
         menu.addAction(self.action_focus_next)
+        menu.addAction(self.action_sync_input)
         menu.addSeparator()
         menu.addAction(self.action_close_tab)
         menu.addAction(self.action_quit)
@@ -538,6 +551,7 @@ class MainWindow(QMainWindow):
         tab.error_raised.connect(lambda message, h=host: self._on_session_error(h, message))
         tab.title_changed.connect(lambda title, h=host: self._on_title(h, title))
         tab.closed.connect(lambda h=host: self._on_session_finished(h))
+        tab.input_generated.connect(lambda data, t=tab: self._on_pane_input(t, data))
 
         index = self.tabs_widget.addTab(tab, host.display_name)
         self.tabs_widget.setTabToolTip(index, host.target)
@@ -1093,10 +1107,20 @@ class MainWindow(QMainWindow):
             return
 
         if isinstance(widget, SplitTerminalTab):
+            before = widget.orientation
             pane = widget.split(orientation)
 
             if pane is None:
-                self.statusBar().showMessage(f"分屏数量已达上限（{SplitTerminalTab.MAX_PANES}）")
+                if before != widget.orientation:
+                    self.statusBar().showMessage(
+                        f"已切换为{'左右' if orientation == Qt.Orientation.Horizontal else '上下'}分屏"
+                        f"（保持 {len(widget.panes)} 个面板，最多 {SplitTerminalTab.MAX_PANES} 个）"
+                    )
+                else:
+                    self.statusBar().showMessage(
+                        f"分屏最多 {SplitTerminalTab.MAX_PANES} 个面板"
+                        f"（另一种方向可切换布局）"
+                    )
             else:
                 pane.view.setFocus()
 
@@ -1119,6 +1143,8 @@ class MainWindow(QMainWindow):
 
         split.title_changed.connect(lambda text, h=host: self._on_title(h, text))
         split.failed.connect(lambda message, h=host: self._on_session_error(h, message))
+        split.pane_input.connect(self._on_pane_input)
+        widget.input_generated.connect(lambda data, t=widget: self._on_pane_input(t, data))
 
         new_index = self.tabs_widget.addTab(split, title or host.display_name)
         self.tabs_widget.setTabToolTip(new_index, host.target)
@@ -1128,6 +1154,7 @@ class MainWindow(QMainWindow):
         self._refresh_tab_title(host)
         self._update_window_title()
         self._sync_command_actions()
+        self.set_sync_input(self.sync_input)  # 新面板也要带上同步标识
 
     def focus_next_pane(self) -> None:
         widget = self.tabs_widget.currentWidget()
@@ -1136,6 +1163,72 @@ class MainWindow(QMainWindow):
             widget.focus_next()
         else:
             self.statusBar().showMessage("当前标签没有分屏")
+
+    # ------------------------------------------------------------------
+    # 同步输入（批量配环境）
+    # ------------------------------------------------------------------
+
+    def _remote_panes(self) -> list:
+        """所有已打开的远端 SSH 终端面板（不含本地终端、不含 SFTP）。"""
+
+        panes = []
+
+        for tab in self._iter_terminal_tabs():
+            candidates = tab.panes if isinstance(tab, SplitTerminalTab) else [tab]
+
+            for pane in candidates:
+                if not getattr(pane, "is_local", False):
+                    panes.append(pane)
+
+        return panes
+
+    def set_sync_input(self, enabled: bool) -> None:
+        """开关"同步输入"：把当前终端的输入同时发到其它 SSH 会话。"""
+
+        self.sync_input = bool(enabled)
+        self.action_sync_input.setText(
+            "同步输入到所有会话（已开启）" if enabled else "同步输入到所有会话"
+        )
+
+        for pane in self._all_terminal_panes_all():
+            setter = getattr(pane, "set_sync_badge", None)
+
+            if callable(setter):
+                setter(enabled and not getattr(pane, "is_local", False))
+
+        if enabled:
+            count = len(self._remote_panes())
+            self.statusBar().showMessage(
+                f"⇄ 同步输入已开启：输入会同时发送到其余 {max(0, count - 1)} 个会话（Ctrl+Shift+B 关闭）"
+            )
+        else:
+            self.statusBar().showMessage("同步输入已关闭")
+
+    def _on_pane_input(self, source, data: bytes) -> None:
+        """某个终端产生了输入：开启同步时转发给其它远端会话。"""
+
+        if not self.sync_input or not data:
+            return
+
+        if getattr(source, "is_local", False):
+            return
+
+        delivered = 0
+
+        for pane in self._remote_panes():
+            if pane is source:
+                continue
+
+            # 用直写通道，避免转发又被当成"用户输入"再次广播（回环）
+            write = getattr(pane, "write_input", None)
+
+            if callable(write):
+                write(data)
+                delivered += 1
+
+        if delivered:
+            self.statusBar().showMessage(f"⇄ 已同步输入到 {delivered} 个会话")
+            self._sync_flash += 1
 
     # ------------------------------------------------------------------
     # 主机导入 / 导出

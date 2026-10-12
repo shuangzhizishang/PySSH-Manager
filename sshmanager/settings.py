@@ -59,3 +59,18 @@ DEFAULT_ROWS = 32
 
 DEFAULT_FONT_FAMILY = "Consolas"
 DEFAULT_FONT_SIZE = 12
+
+
+def trace_ui(message: str) -> None:
+    """界面耗时追踪：设置 ``PYSSH_TRACE_UI=1`` 时把耗时打到 stderr。
+
+    用来定位"某个操作卡住"这类问题（例如列目录、填表各花了多久）。
+    """
+
+    if os.environ.get("PYSSH_TRACE_UI", "").strip() not in ("1", "true", "True", "yes"):
+        return
+
+    import sys
+    import time
+
+    print(f"[ui {time.strftime('%H:%M:%S')}] {message}", file=sys.stderr, flush=True)

@@ -21,7 +21,11 @@ class SplitTerminalTab(QWidget):
     closed = Signal()
     failed = Signal(str)
 
-    MAX_PANES = 4
+    #: 某个面板产生了输入（面板, 数据），主窗口据此做同步广播
+    pane_input = Signal(object, object)
+
+    #: 最多两个面板（左右或上下各两个；再多屏幕太挤，且会话数翻倍不好管）
+    MAX_PANES = 2
 
     def __init__(
         self,
@@ -89,6 +93,7 @@ class SplitTerminalTab(QWidget):
         pane.title_changed.connect(self._on_pane_title)
         pane.failed.connect(self.failed)
         pane.closed.connect(lambda p=pane: self._on_pane_closed(p))
+        pane.input_generated.connect(lambda data, p=pane: self.pane_input.emit(p, data))
 
         # 先隐藏再插入，避免窗口已显示时插入控件触发 Qt 布局递归
         pane.setVisible(False)
@@ -101,12 +106,29 @@ class SplitTerminalTab(QWidget):
         return pane
 
     def split(self, orientation: Qt.Orientation) -> SessionTab | None:
-        """按指定方向再开一个面板（与现有分屏方向一致）。"""
+        """按指定方向分屏（左右/上下都**最多两个面板**）。
 
+        - 还没到上限：新增一个面板，返回它
+        - 已经是两个面板：只**旋转现有布局**（左右 ↔ 上下），不再加面板，返回 None
+        """
+
+        if len(self.panes) < self.MAX_PANES:
+            if self.splitter.orientation() != orientation:
+                self.splitter.setOrientation(orientation)
+
+            return self.add_pane(activate=True)
+
+        # 已到上限：允许切换排列方向，但绝不新增面板
         if self.splitter.orientation() != orientation:
             self.splitter.setOrientation(orientation)
 
-        return self.add_pane(activate=True)
+        return None
+
+    @property
+    def orientation(self) -> Qt.Orientation:
+        """当前分屏方向（左右=Horizontal，上下=Vertical）。"""
+
+        return self.splitter.orientation()
 
     def focus_next(self) -> None:
         panes = self.panes

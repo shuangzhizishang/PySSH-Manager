@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import deque
 from typing import Iterator
 
 import pyte
+
+#: 回滚历史保留多少行
+HISTORY_LINES = 2000
 
 
 # ----------------------------------------------------------------------
@@ -77,6 +81,44 @@ class CellStyle:
     reverse: bool = False
 
 
+class Scrollback:
+    """最简回滚缓冲：只保存滚出屏幕的行。
+
+    保持与 pyte ``HistoryScreen.history`` 一样的访问方式（``top`` / ``bottom``），
+    这样界面层不用改。
+    """
+
+    __slots__ = ("top", "bottom")
+
+    def __init__(self, limit: int = 2000) -> None:
+        self.top: deque = deque(maxlen=max(1, int(limit)))
+        self.bottom: deque = deque()
+
+
+class FastScreen(pyte.Screen):
+    """普通 ``pyte.Screen`` + 自己记录回滚行。
+
+    **为什么不用 pyte 的 HistoryScreen**：它会重写 ``__getattribute__``，给每个
+    流事件都现造一个闭包，并在 ``after_event`` 里做额外处理；实测解析吞吐只有普通
+    ``Screen`` 的四分之一（1.4 MB 文本要 34 秒），远端刷屏时界面直接卡死。
+    这里改为只用普通 Screen，在整屏上滚时把离开屏幕的那一行收进有界队列，
+    效果一致但快得多。
+    """
+
+    def __init__(self, columns: int, lines: int, history: int = 2000) -> None:
+        self.history = Scrollback(history)
+        super().__init__(columns, lines)
+
+    def index(self) -> None:  # noqa: D102 - 见类文档
+        top, bottom = self.margins or pyte.screens.Margins(0, self.lines - 1)
+
+        # 只有"整屏上滚"才计入回滚历史；局部滚动区域（如 vim 的分屏）不算
+        if top == 0 and bottom == self.lines - 1 and self.cursor.y == bottom:
+            self.history.top.append(self.buffer[0].copy())
+
+        super().index()
+
+
 class Emulator:
     """把 SSH 字节流喂给 pyte，并暴露屏幕内容。"""
 
@@ -84,11 +126,10 @@ class Emulator:
         self._columns = max(2, int(columns))
         self._lines = max(2, int(lines))
 
-        self.screen = pyte.HistoryScreen(
+        self.screen = FastScreen(
             self._columns,
             self._lines,
-            history=2000,
-            ratio=0.5,
+            history=HISTORY_LINES,
         )
         self.screen.set_mode(pyte.modes.LNM)
 

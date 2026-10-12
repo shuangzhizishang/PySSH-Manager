@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QDir, QEvent, QModelIndex, Qt, Signal
@@ -29,8 +30,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..fileops import (
-    MODE_COPY,
+from ..settings import trace_ui
+from ..fileops import (    MODE_COPY,
     MODE_CUT,
     SIDE_LOCAL,
     SIDE_REMOTE,
@@ -42,7 +43,7 @@ from ..fileops import (
 )
 from ..fileworker import LocalFileWorker
 from ..hosts import Host
-from ..sftpcore import RemoteEntry, format_size, normalize_remote_path, parent_remote_path
+from ..sftpcore import RemoteEntry, format_size, match_name, normalize_remote_path, parent_remote_path
 from ..sftpworker import SftpWorker
 from ..sshclient import SSHClient
 
@@ -159,6 +160,9 @@ class SftpPanel(QWidget):
     #: 传输进度文字（供主窗口更新标签标题），传输结束发空串
     progress_text = Signal(str)
 
+    #: 表格最多显示多少行：更大的目录请用过滤框缩小范围（避免一次性塞几万行）
+    MAX_TABLE_ROWS = 3000
+
     def __init__(
         self,
         host: Host,
@@ -172,6 +176,8 @@ class SftpPanel(QWidget):
         self.credential = credential
         self._closing = False
         self._remote_entries: list[RemoteEntry] = []
+        #: 过滤/截断后真正显示在表格里的条目（表格行号 ↔ 条目靠它映射）
+        self._visible_entries: list[RemoteEntry] = []
         self._remote_path = "/"
         self._home = "/"
 
@@ -299,7 +305,9 @@ class SftpPanel(QWidget):
         self.local_view.setRootIndex(QModelIndex())
         self.local_view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.local_view.setAlternatingRowColors(True)
-        self.local_view.setSortingEnabled(True)
+        # 不开视图排序：QFileSystemModel 本身已按名称排序，视图再排序会让
+        # 大目录（如 System32 三千项）填充慢上好几倍。
+        self.local_view.setSortingEnabled(False)
         self.local_view.setAcceptDrops(True)
         self.local_view.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
         self.local_view.setDropIndicatorShown(True)
@@ -490,6 +498,16 @@ class SftpPanel(QWidget):
         path_row.addWidget(refresh_button)
         column.addLayout(path_row)
 
+        # 过滤框：目录里几千个文件时靠它快速定位（不用把整目录塞进表格）
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("过滤"))
+        self.remote_filter = QLineEdit()
+        self.remote_filter.setPlaceholderText("按名称过滤当前目录（支持多关键字，空格分隔）…")
+        self.remote_filter.setClearButtonEnabled(True)
+        self.remote_filter.textChanged.connect(lambda _text: self._apply_remote_filter())
+        filter_row.addWidget(self.remote_filter, 1)
+        column.addLayout(filter_row)
+
         self.remote_table = RemoteTable(self)
         self.remote_table.setColumnCount(3)
         self.remote_table.setHorizontalHeaderLabels(["名称", "大小", "修改时间"])
@@ -501,9 +519,13 @@ class SftpPanel(QWidget):
         self.remote_table.setDragEnabled(True)
         self.remote_table.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
         self.remote_table.setAcceptDrops(True)
-        self.remote_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.remote_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.remote_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        # 列宽固定：ResizeToContents 会让每次插行都扫描全表（几千行时明显卡顿）
+        header = self.remote_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(1, 90)
+        header.resizeSection(2, 150)
         self.remote_table.doubleClicked.connect(self._on_remote_activated)
         self.remote_table.itemSelectionChanged.connect(self._sync_buttons)
         self.remote_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -681,44 +703,92 @@ class SftpPanel(QWidget):
         self.refresh_remote(self._home)
 
     def _on_listing(self, path: str, entries) -> None:
+        started = time.perf_counter()
         self._remote_path = normalize_remote_path(path)
         self.remote_path_edit.setText(self._remote_path)
         self._remote_entries = list(entries)
 
-        self.remote_table.setRowCount(0)
+        # 填表与状态提示都由过滤逻辑统一处理（含"仅显示前 N 项"的提示）
+        self._apply_remote_filter()
 
-        for entry in self._remote_entries:
-            row = self.remote_table.rowCount()
-            self.remote_table.insertRow(row)
-
-            name_item = QTableWidgetItem(("📁 " if entry.is_dir else "📄 ") + entry.name)
-            name_item.setData(Qt.ItemDataRole.UserRole, entry.name)
-            name_item.setToolTip(entry.path)
-
-            self.remote_table.setItem(row, 0, name_item)
-            self.remote_table.setItem(row, 1, QTableWidgetItem(entry.size_text))
-            self.remote_table.setItem(row, 2, QTableWidgetItem(entry.modified_text))
-
-        self._set_status(f"● 已连接 · {len(self._remote_entries)} 项", "#3fb950")
+        trace_ui(
+            f"listdir {self._remote_path}：{len(self._remote_entries)} 项，"
+            f"填表 {len(self._visible_entries)} 行，{(time.perf_counter() - started) * 1000:.0f}ms"
+        )
         self._sync_buttons()
+
+    def _match_filter(self, entry) -> bool:
+        """多关键字过滤：空格分隔的关键字需要都出现（不区分大小写）。"""
+
+        return match_name(entry.name, self.remote_filter.text())
+
+    def _apply_remote_filter(self, update_status: bool = True) -> None:
+        """按过滤框重填远端表格（批量填充，一次到位）。"""
+
+        filtered = [entry for entry in self._remote_entries if self._match_filter(entry)]
+        capped = filtered[: self.MAX_TABLE_ROWS]
+        self._visible_entries = capped
+
+        started = time.perf_counter()
+        self._fill_remote_table(capped)
+        trace_ui(f"填表 {len(capped)} 行 {((time.perf_counter() - started) * 1000):.0f}ms")
+
+        if not update_status:
+            return
+
+        total = len(self._remote_entries)
+        shown = len(capped)
+        color = "#3fb950"
+
+        if len(filtered) > shown:
+            text = f"匹配 {len(filtered)} 项，仅显示前 {shown} 项（请用过滤缩小范围）"
+            color = "#d29922"
+        elif len(filtered) < total:
+            text = f"共 {total} 项，过滤后显示 {shown} 项"
+            color = "#d29922"
+        else:
+            text = f"共 {total} 项"
+
+        self._set_status(f"● 已连接 · {text}", color)
+        self._sync_buttons()
+
+    def _fill_remote_table(self, entries: list) -> None:
+        """批量填表：关更新 + 一次性定行数（大目录也不会卡）。"""
+
+        table = self.remote_table
+        table.setUpdatesEnabled(False)
+
+        try:
+            table.clearContents()
+            table.setRowCount(len(entries))
+
+            for row, entry in enumerate(entries):
+                name_item = QTableWidgetItem(("📁 " if entry.is_dir else "📄 ") + entry.name)
+                name_item.setData(Qt.ItemDataRole.UserRole, entry.name)
+                name_item.setToolTip(entry.path)
+                table.setItem(row, 0, name_item)
+                table.setItem(row, 1, QTableWidgetItem(entry.size_text))
+                table.setItem(row, 2, QTableWidgetItem(entry.modified_text))
+        finally:
+            table.setUpdatesEnabled(True)
 
     def _selected_remote(self) -> list[RemoteEntry]:
         rows = sorted({index.row() for index in self.remote_table.selectedIndexes()})
         result = []
 
         for row in rows:
-            if 0 <= row < len(self._remote_entries):
-                result.append(self._remote_entries[row])
+            if 0 <= row < len(self._visible_entries):
+                result.append(self._visible_entries[row])
 
         return result
 
     def _on_remote_activated(self, index) -> None:
         row = index.row()
 
-        if not (0 <= row < len(self._remote_entries)):
+        if not (0 <= row < len(self._visible_entries)):
             return
 
-        entry = self._remote_entries[row]
+        entry = self._visible_entries[row]
 
         if entry.is_dir:
             self.refresh_remote(entry.path)

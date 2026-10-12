@@ -13,6 +13,26 @@ from pathlib import Path
 
 import paramiko
 
+#: 递归遍历目录的最大深度与最大文件数（防止软链成环时无限递归）
+MAX_TREE_DEPTH = 24
+MAX_TREE_FILES = 100_000
+
+
+def match_name(name: str, pattern: str) -> bool:
+    """名称过滤：空格分隔的关键字需要全部出现（不区分大小写）。
+
+    目录里几千个文件时用它在界面里快速定位。
+    """
+
+    words = (pattern or "").lower().split()
+
+    if not words:
+        return True
+
+    lowered = name.lower()
+
+    return all(word in lowered for word in words)
+
 CHUNK_SIZE = 64 * 1024
 
 
@@ -186,8 +206,7 @@ def parent_remote_path(path: str) -> str:
     return normalize_remote_path(posixpath.dirname(normalized))
 
 
-class SFTPError(Exception):
-    """SFTP 操作失败。"""
+class SFTPError(Exception):    """SFTP 操作失败。"""
 
 
 class SftpClient:
@@ -375,19 +394,43 @@ class SftpClient:
         except Exception:  # noqa: BLE001
             return 0
 
+    def real_path(self, path: str) -> str:
+        """解析远端路径的真实位置（跟着符号链接走）；失败就返回原路径。
+
+        递归遍历目录时用它判断"这个目录是不是已经走过了"——远端如果有指向
+        上级目录的软链（很常见），不做判断就会无限递归、表现成"SFTP 卡死"。
+        """
+
+        try:
+            return normalize_remote_path(self._client().normalize(normalize_remote_path(path)))
+        except Exception:  # noqa: BLE001
+            return normalize_remote_path(path)
+
     def tree_size(self, remote_dir: str, limit: int = 4000) -> tuple[int, int]:
         """递归统计远端目录的 ``(文件数, 总字节)``，用于显示整体百分比。
 
         目录特别大时只扫到 ``limit`` 项就停（返回已知部分），避免传输前卡很久。
+        遇到软链成环时靠 ``visited`` 提前退出。
         """
 
         files = 0
         total = 0
         scanned = 0
-        stack = [normalize_remote_path(remote_dir)]
+        visited: set[str] = set()
+        stack = [(normalize_remote_path(remote_dir), 0)]
 
         while stack:
-            current = stack.pop()
+            current, depth = stack.pop()
+
+            if depth > MAX_TREE_DEPTH:
+                continue
+
+            real = self.real_path(current)
+
+            if real in visited:
+                continue
+
+            visited.add(real)
 
             try:
                 entries = self.listdir(current)
@@ -396,7 +439,7 @@ class SftpClient:
 
             for entry in entries:
                 if entry.is_dir:
-                    stack.append(entry.path)
+                    stack.append((entry.path, depth + 1))
                     continue
 
                 files += 1
@@ -466,8 +509,13 @@ class SftpClient:
         resume: bool = False,
         on_file=None,
         counter: list | None = None,
+        visited: set[str] | None = None,
+        depth: int = 0,
     ) -> tuple[int, int]:
-        """递归下载目录，返回 ``(文件数, 字节数)``。"""
+        """递归下载目录，返回 ``(文件数, 字节数)``。
+
+        ``visited`` 记录已进入的真实目录（解析软链后），避免软链成环时无限递归。
+        """
 
         remote_dir = normalize_remote_path(remote_dir)
         local_dir = Path(local_dir)
@@ -475,6 +523,17 @@ class SftpClient:
         files = 0
         total_bytes = 0
         state = counter if counter is not None else [0, 0]
+        seen = visited if visited is not None else set()
+
+        if depth > MAX_TREE_DEPTH:
+            return 0, 0
+
+        real = self.real_path(remote_dir)
+
+        if real in seen:
+            return 0, 0
+
+        seen.add(real)
 
         for entry in self.listdir(remote_dir):
             if cancelled is not None and cancelled():
@@ -489,12 +548,17 @@ class SftpClient:
                     resume=resume,
                     on_file=on_file,
                     counter=state,
+                    visited=seen,
+                    depth=depth + 1,
                 )
                 files += sub_files
                 total_bytes += sub_bytes
                 continue
 
             state[0] += 1
+
+            if state[0] > MAX_TREE_FILES:
+                raise SFTPError(f"目录文件过多（超过 {MAX_TREE_FILES} 个），已停止")
 
             if on_file is not None:
                 on_file(state[0], state[1], entry.name)
