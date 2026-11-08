@@ -8,7 +8,8 @@
 2. **随包资源**：Qt 平台插件、pywinpty 的 ConPTY 支持、应用图标
 3. **界面构建**：用 Fusion 样式建出主窗口，菜单与工具栏动作齐全，然后干净退出
 4. **本地终端**：ConPTY 起一个 shell，执行 ``echo`` 并读到回显
-5. **SSH / SFTP**（给了主机才查）：连接、执行命令、列目录
+5. **AI 助手**：模块导入、提示词、命令抽取/风险分级、配置读写（不联网）
+6. **SSH / SFTP**（给了主机才查）：连接、执行命令、列目录
 
 用法::
 
@@ -111,6 +112,8 @@ def _check_gui(data_dir: Path) -> dict:
             "action_connect", "action_new_session", "action_sftp", "action_command_library",
             "action_copy_output", "action_save_output", "action_favorite_selection",
             "action_select_to_copy", "action_local", "action_split_h",
+            "action_split_hosts_h", "action_split_hosts_v", "action_sync_input",
+            "action_ai", "action_ai_settings", "action_ai_explain",
         ]
         missing = [name for name in actions if getattr(window, name, None) is None]
 
@@ -125,6 +128,100 @@ def _check_gui(data_dir: Path) -> dict:
         import traceback
 
         return {"ok": False, "detail": f"{type(error).__name__}: {error}\n{traceback.format_exc()}"}
+
+
+def _check_ai(data_dir: Path) -> dict:
+    """AI 助手：模块导入、提示词、命令抽取、操作抽取、配置读写（不联网）。"""
+
+    try:
+        from .ai import AiConfig, DeepSeekClient, extract_commands
+        from .ai.actions import extract_actions
+        from .ai.context import parse_environment_output
+        from .ai.prompts import build_system_prompt
+    except Exception as error:  # noqa: BLE001
+        return {"ok": False, "detail": f"无法导入 AI 模块：{error}"}
+
+    problems: list[str] = []
+
+    # 1) 环境解析 + 提示词要按发行版给出对应包管理器
+    environment = parse_environment_output(
+        "###OS\n"
+        'NAME="CentOS Linux"\n'
+        'PRETTY_NAME="CentOS Linux 7 (Core)"\n'
+        'ID="centos"\n'
+        "###KERNEL\nLinux 3.10.0-1160.119.1.el7.x86_64 x86_64\n"
+        "###HOST\nselftest-host\n"
+        "###SHELL\n/bin/bash\n"
+        "###USER\nroot\n0\n"
+        "###PM\nyum \n"
+        "###VIRT\nkvm\n"
+    )
+
+    if environment.get("distro_id") != "centos":
+        problems.append(f"发行版解析异常：{environment.get('distro_id')!r}")
+
+    if "yum" not in environment.get("package_managers", ""):
+        problems.append(f"包管理器解析异常：{environment.get('package_managers')!r}")
+
+    prompt = build_system_prompt(AiConfig(), environment)
+
+    if "yum" not in prompt:
+        problems.append("系统提示词没有带出 yum")
+
+    # 2) 命令抽取 + 风险分级（危险命令必须被标出来）
+    reply = (
+        "先看系统版本：\n\n```bash\ncat /etc/redhat-release\n```\n\n"
+        "删掉旧数据再重装：\n\n```bash\nrm -rf /\n```\n\n"
+        "```pyssh-action\n"
+        '{"action": "open_sftp", "reason": "上传安装包"}\n'
+        "```\n"
+    )
+
+    commands = extract_commands(reply)
+
+    if len(commands) != 2:
+        problems.append(f"命令抽取数量异常：{len(commands)}")
+
+    if not any(item.risk == "danger" for item in commands):
+        problems.append("危险命令没有被识别")
+
+    actions = extract_actions(reply)
+
+    if len(actions) != 1 or actions[0].action.name != "open_sftp":
+        problems.append(f"操作抽取异常：{[item.action.name for item in actions]}")
+
+    # 3) API 地址拼接
+    if DeepSeekClient("x", AiConfig()).endpoint() != "https://api.deepseek.com/chat/completions":
+        problems.append("官方地址拼接异常")
+
+    proxy = DeepSeekClient("x", AiConfig(base_url="https://proxy.example.com/v1")).endpoint()
+
+    if proxy != "https://proxy.example.com/v1/chat/completions":
+        problems.append(f"代理地址拼接异常：{proxy}")
+
+    # 4) 配置读写（key 不在 JSON 里）
+    try:
+        config = AiConfig(model="deepseek-reasoner", temperature=0.5, system_extra="自检")
+        config.save()
+        loaded = AiConfig.load()
+
+        if loaded.model != "deepseek-reasoner" or abs(loaded.temperature - 0.5) > 1e-6:
+            problems.append("配置读写不一致")
+
+        raw = (Path(data_dir) / "ai_config.json").read_text(encoding="utf-8")
+
+        if "api_key" in raw.lower():
+            problems.append("配置里出现了 api_key（应该只存凭据库）")
+    except Exception as error:  # noqa: BLE001
+        problems.append(f"配置读写失败：{type(error).__name__}: {error}")
+
+    detail = (
+        f"发行版={environment.get('pretty_name', '?')}，包管理器={environment.get('package_managers', '?')}，"
+        f"命令 {len(commands)} 条（风险 {[item.risk for item in commands]}），"
+        f"操作 {len(actions)} 个，问题 {problems or '无'}"
+    )
+
+    return {"ok": not problems, "detail": detail}
 
 
 def _check_local_terminal(timeout: float = 20.0) -> dict:
@@ -248,6 +345,7 @@ def run(
     os.environ.setdefault("PYSSH_DATA_DIR", str(data_dir))
 
     checks["gui"] = _check_gui(data_dir)
+    checks["ai"] = _check_ai(data_dir)
     checks["local_terminal"] = _check_local_terminal()
 
     if host:

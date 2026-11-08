@@ -854,6 +854,18 @@ class TerminalView(QAbstractScrollArea):
         if text:
             self.data_to_send.emit(text.replace("\r\n", "\r").replace("\n", "\r").encode("utf-8"))
 
+    def insert_text(self, text: str) -> None:
+        """把文本放进终端（不回车），方便先改一改再执行。
+
+        AI 助手的"插入终端"按钮用它；等价于手动打字，但不会触发命令历史。
+        注意：文本里的换行等同于回车，多行文本会被逐行执行，调用方要自己拆。
+        """
+
+        if not text:
+            return
+
+        self.data_to_send.emit(text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8"))
+
     # ------------------------------------------------------------------
     # 键盘
     # ------------------------------------------------------------------

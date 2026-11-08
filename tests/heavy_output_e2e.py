@@ -19,6 +19,13 @@ from pathlib import Path
 os.environ.setdefault("PYSSH_DATA_DIR", tempfile.mkdtemp(prefix="pyssh-heavy-"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Windows 控制台/重定向可能是 GBK，中文输出统一按 UTF-8，避免打印报错中断测试
+for stream in (sys.stdout, sys.stderr):
+    try:
+        stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        pass
+
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox
 

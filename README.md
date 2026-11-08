@@ -52,11 +52,16 @@
 - **两台虚拟机并排对比**：一个标签里放**两台不同主机**——左侧选中两台主机 →
   `Ctrl+Alt+E` 左右并排 / `Ctrl+Alt+O` 上下并排（右键菜单里也有），
   或者右键某一台选「并排到当前分屏」，把它加到当前会话旁边；
-  标签标题显示 `192.168.206.130 ⇄ 192.168.206.131`，每个面板的状态栏各自显示自己的主机，
+  标签标题显示 `主机A ⇄ 主机B`，每个面板的状态栏各自显示自己的主机，
   再配合下面的「同步输入」就能一条命令同时配两台机器
 - **同步输入（批量配环境）**：`Ctrl+Shift+B` 开启后，在当前终端输入的命令会**同时发送到
   其它已打开的 SSH 会话**——开两台机器，敲一次命令两边一起执行；
   开启时工具栏按钮与每个会话的状态栏都会显示 `⇄ 同步输入`，避免误操作
+- **DeepSeek AI 助手**：右侧面板（`Ctrl+Shift+A`），提问前先采集当前机器的发行版 /
+  包管理器 / 是否 root 等信息，再连着终端尾部输出一起问，所以给的是**这台机器能用的**
+  命令；回复里的代码块变成卡片，可「执行 / 插入终端 / 复制」，危险命令二次确认；
+  执行完自动把终端输出回传给 AI 分析；还能按一句话操作软件本身（打开 SFTP、
+  左右/上下分屏、开同步输入…）。详见 [AI 助手（DeepSeek）](#ai-助手deepseek)
 - **同一主机多会话**：`Ctrl+Shift+N`（或右键「新会话」）可给一台主机开多条并行会话，
   标签按 `(1)(2)(3)` 编号，侧边栏主机条目显示 `×N`（开着的会话数）；
   「连接」在已有会话时只切到该标签，不会重复连接
@@ -97,10 +102,50 @@
   `Ctrl+Shift+B` 同步输入（多主机一起执行）、
   `Ctrl+Shift+L` 命令库、`Ctrl+Shift+S` 收藏选中内容、
   `Ctrl+Alt+C` 复制全部输出、`Ctrl+Alt+S` 保存输出、
+  `Ctrl+Shift+A` AI 面板、`Ctrl+Shift+Alt+A` 让 AI 解释当前终端输出、
   `Ctrl+ +/-/0` 字体缩放、`Ctrl+鼠标滚轮` 缩放
 
 命令行参数：`--host/--port/--username/--password`、`--no-autoconnect`、`--local`（附带打开本地终端）、
 `--selftest <报告路径>`（打包后的自检，见下文）。
+
+## AI 助手（DeepSeek）
+
+右侧的 AI 面板（`Ctrl+Shift+A` 开关）接 DeepSeek 官方 API，用来帮你配机器和操作这个软件。
+它**不猜**：提问前先在当前会话里采集机器信息（发行版、内核、shell、包管理器、是否 root、
+是否容器/虚拟机），并把终端最后几十行输出一起带上，所以给出来的命令是贴着这台机器的
+（CentOS 用 `yum`、Ubuntu 用 `apt`、Alpine 用 `apk`）。
+
+### 配置 Key
+
+1. 菜单 `AI → AI 设置`（或面板右上角齿轮）。
+2. 填 API Key（在 <https://platform.deepseek.com/api_keys> 申请），点「测试连接」验证。
+3. 点「保存」。Key 存进应用的**加密凭据库**（Windows 下 DPAPI），不写进配置文件、
+   不进 git；地址/模型/温度/最大 token/超时等参数存
+   `%APPDATA%\PySSH-Manager\ai_config.json`。
+   也支持环境变量 `PYSSH_AI_API_KEY` / `DEEPSEEK_API_KEY`（界面里保存的 Key 优先）。
+4. 默认地址 `https://api.deepseek.com`、模型 `deepseek-chat`；也能填中转/代理地址
+   （填 `https://host/v1` 会自动补成 `/v1/chat/completions`），模型可切 `deepseek-reasoner`。
+
+### 能做什么
+
+- **给命令**：回复里每个 ```` ```bash ```` 代码块变成一张卡片，标出风险等级
+  （安全 / 需谨慎 / 危险），可「执行」（直接发到当前会话）、「插入终端」（放到命令行
+  不回车，自己改完再执行）、「复制」。危险命令（`rm -rf /`、`mkfs`、`dd of=/dev/` 等）
+  执行前再确认一次。
+- **自动分析结果**：执行后应用盯着终端，等命令安静下来把输出回传给 AI，它指出报错原因
+  并给下一步（面板底部的「自动分析」可关）。
+- **操作软件本身**：说一句「打开 SFTP」「上下分屏」，AI 返回应用操作并显示成 ⚙ 卡片，
+  点一下执行——打开 SFTP、端口转发、左右/上下分屏、新会话、重连、同步输入开关、
+  复制全部输出、保存输出。
+- **快捷按钮**：诊断机器（磁盘/内存/负载/失败的服务）、装环境（按发行版给整套步骤）、
+  磁盘排查；选中终端输出可以让它「解释输出」。
+- **流式输出**：边生成边显示，可「停止」中断；`deepseek-reasoner` 的思考过程以灰色小字显示。
+
+### 注意
+
+- 请求直连 `api.deepseek.com`（只发你问的问题 + 机器信息 + 终端尾部输出），不经过第三方。
+- 命令要你点「执行」才会发到会话里，AI 自己不能偷偷执行。
+- 不想带机器信息/终端输出时，把面板底部的「环境」「终端输出」两个勾去掉。
 
 ## 打包成 Windows 程序（exe）
 
@@ -198,7 +243,16 @@ sshmanager/
   fileops.py                文件剪贴板与撤销栈（复制/剪切/粘贴/撤销，四个方向）
   fileworker.py             本地文件操作后台线程（复制/移动/回收站/删除）
   commands.py               命令库：收藏、历史、条目剪贴板与撤销
-  selftest.py               打包后自检（依赖/资源/界面/本地终端/SSH/SFTP）
+  ai/
+    __init__.py              AI 包对外导出
+    config.py                AI 配置（地址/模型/温度…）与 Key 读取
+    client.py                DeepSeek 客户端（SSE 流式、错误映射、连接测试）
+    prompts.py               系统提示词（发行版手册 + 输出规范 + 软件操作清单）
+    commands.py              从回复里抽命令、风险分级、去重
+    actions.py               从回复里抽「操作软件」指令
+    context.py               采集机器环境（发行版/包管理器/root/容器/虚拟机）
+    worker.py                AI 聊天、测试连接、环境采集的后台线程
+  selftest.py               打包后自检（依赖/资源/界面/本地终端/AI/SSH/SFTP）
   forwarding.py             三类端口转发（-L / -R / SOCKS5 -D）
   terminal/
     core.py                 pyte 封装 + 键盘序列编码
@@ -210,6 +264,8 @@ sshmanager/
     split_tab.py            分屏容器
     sftp_panel.py           SFTP 双栏面板（含拖拽、递归传输、复制/剪切/粘贴/撤销）
     command_library.py      命令库对话框（收藏 / 历史 / 条目操作）
+    ai_panel.py             AI 面板（聊天、命令卡片、操作卡片、自动分析结果）
+    ai_settings.py          AI 设置对话框（Key、地址、模型、测试连接）
     forward_dialog.py       端口转发管理对话框（三种类型）
     key_dialog.py           密钥管理对话框
     replay_dialog.py        录制回放对话框
@@ -228,7 +284,17 @@ tests/
   test_hostio.py            主机导入导出单测
   test_keygen.py            密钥生成与 ProxyJump / 标签解析单测
   test_recording_sync_ppk.py 录制、配置同步、PPK 导入单测
+  test_commands.py          命令库（收藏/历史/条目复制粘贴撤销）单测
+  test_fileops.py           文件剪贴板与撤销栈单测
+  test_transfer_progress.py 传输百分比与 ETA 单测
+  test_sync_and_ui.py       同步输入、分屏上限、SFTP 过滤/截断单测
+  test_ai.py                AI 单测（命令抽取/风险分级/提示词/配置/SSE 流式解析）
   gui_smoke.py              离屏 GUI 冒烟（不需要联网）
+  ai_e2e.py                 AI 面板端到端（本地 mock SSE 服务器 + 截图）
+  multi_host_sync_e2e.py    两台主机同步输入端到端
+  two_host_split_e2e.py     两台主机左右/上下并排端到端
+  heavy_output_e2e.py       重输出渲染（刷屏 + 进度条，验证不黑屏）
+  close_clean_check.py      关闭窗口清理检查（线程/连接正常退出）
   ssh_smoke.py              真实 SSH 冒烟（需要可达的服务器）
   gui_e2e.py                真实 GUI 端到端 + 截图
   gui_features_e2e.py       本地终端 / 分屏 / 三类转发 / 导入导出 GUI 验证
@@ -290,9 +356,16 @@ $env:QT_QPA_PLATFORM='offscreen'
 
 # SFTP 传输百分比（单文件上传/下载 + 目录批次进度）
 .venv\Scripts\python.exe tests\sftp_progress_e2e.py --host <你的服务器> --password <密码>
+
+# AI 助手（本地 mock 服务器，不需要真 Key、不出网）
+.venv\Scripts\python.exe tests\ai_e2e.py
+
+# 两台主机同步输入 / 左右上下并排（需要两台主机）
+.venv\Scripts\python.exe tests\multi_host_sync_e2e.py --host <服务器A> --host2 <服务器B> --password <密码>
+.venv\Scripts\python.exe tests\two_host_split_e2e.py --host <服务器A> --host2 <服务器B> --password <密码>
 ```
 
-## 十二个已踩过的坑（改动时注意）
+## 十三个已踩过的坑（改动时注意）
 
 1. **必须使用 Fusion 样式**：Qt 6.11 在 Windows 上默认用 `windows11` 原生样式，
    该样式会忽略自定义 `QPainter` 的画笔颜色，终端文字会被画成系统默认文字色，
@@ -361,3 +434,9 @@ $env:QT_QPA_PLATFORM='offscreen'
     本地大目录另有两点：`QFileSystemModel` 自身已按名称排序，**视图再开排序**会让
     System32（3000 项）填充慢一倍；远端表格要**一次性 `setRowCount` + 关更新 + 固定列宽**
     （`ResizeToContents` 每插一行都重算全表）。
+13. **不要在 GBK 控制台里 print `✔` / `⇄` 这类符号**：`pwsh` 默认代码页可能是 936，
+    打印会抛 `UnicodeEncodeError`；如果它发生在 Qt 槽函数里，异常被 `sys.excepthook`
+    吞掉、`app.exec()` 永不返回——表现为**测试脚本"卡死"几分钟没有任何输出**
+    （`tests/ai_e2e.py` 曾因此挂住）。测试脚本开头统一
+    `sys.stdout.reconfigure(encoding="utf-8", errors="replace")`（stderr 同样处理），
+    运行时再加 `PYTHONUTF8=1`、`PYTHONIOENCODING=utf-8`。

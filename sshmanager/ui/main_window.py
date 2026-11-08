@@ -9,6 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
+    QDockWidget,
     QFileDialog,
     QInputDialog,
     QLineEdit,
@@ -36,6 +37,7 @@ from ..hosts import Host, HostStore
 from ..keygen import KeyStore
 from ..localsession import conpty_available
 from ..sshclient import SSHClient
+from .ai_panel import AiPanel
 from .forward_dialog import ForwardDialog
 from .host_dialog import HostDialog
 from .key_dialog import KeyManagerDialog
@@ -166,6 +168,21 @@ class MainWindow(QMainWindow):
         )
         self.action_sync_input.toggled.connect(self.set_sync_input)
 
+        # ---------------- AI 助手 ----------------
+
+        self.action_ai = QAction("AI 助手", self)
+        self.action_ai.setShortcut(QKeySequence("Ctrl+Shift+A"))
+        self.action_ai.setCheckable(True)
+        self.action_ai.setToolTip("DeepSeek AI 助手：诊断机器、按发行版装环境、生成并执行命令")
+        self.action_ai.toggled.connect(self.toggle_ai_panel)
+
+        self.action_ai_settings = QAction("AI 设置（API Key）…", self)
+        self.action_ai_settings.triggered.connect(self.open_ai_settings)
+
+        self.action_ai_explain = QAction("让 AI 解释终端输出", self)
+        self.action_ai_explain.setShortcut(QKeySequence("Ctrl+Shift+Alt+A"))
+        self.action_ai_explain.triggered.connect(self.explain_with_ai)
+
         self.action_focus_next = QAction("切换分屏焦点", self)
         self.action_focus_next.setShortcut(QKeySequence("Ctrl+Shift+W"))
         self.action_focus_next.triggered.connect(self.focus_next_pane)
@@ -251,6 +268,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.action_split_hosts_v)
         toolbar.addAction(self.action_focus_next)
         toolbar.addAction(self.action_sync_input)
+        toolbar.addAction(self.action_ai)
         toolbar.addSeparator()
         toolbar.addAction(self.action_new)
         toolbar.addAction(self.action_edit)
@@ -303,6 +321,12 @@ class MainWindow(QMainWindow):
         edit_menu.addSeparator()
         edit_menu.addAction(self.action_select_to_copy)
 
+        ai_menu = self.menuBar().addMenu("AI")
+        ai_menu.addAction(self.action_ai)
+        ai_menu.addAction(self.action_ai_explain)
+        ai_menu.addSeparator()
+        ai_menu.addAction(self.action_ai_settings)
+
         self.host_list = QListWidget()
         self.host_list.setMinimumWidth(220)
         self.host_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
@@ -326,8 +350,118 @@ class MainWindow(QMainWindow):
         splitter.setSizes([240, 940])
 
         self.setCentralWidget(splitter)
+
+        # ---------------- AI 助手停靠面板 ----------------
+
+        self.ai_panel = AiPanel(self.context, self)
+        self.ai_panel.set_action_handler(self._run_ai_action)
+
+        self.ai_dock = QDockWidget("DeepSeek AI 助手", self)
+        self.ai_dock.setObjectName("ai_dock")
+        self.ai_dock.setWidget(self.ai_panel)
+        self.ai_dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self.ai_dock.setMinimumWidth(340)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.ai_dock)
+        self.ai_dock.visibilityChanged.connect(self._on_ai_dock_visibility)
+
+        has_key = self.ai_panel.has_api_key()
+        self.action_ai.setChecked(has_key)
+        self.ai_dock.setVisible(has_key)
+
         self.statusBar().showMessage("就绪")
         self._sync_command_actions()
+
+    # ------------------------------------------------------------------
+    # AI 助手
+    # ------------------------------------------------------------------
+
+    def _current_terminal_pane(self):
+        """当前标签里的终端面板（分屏取焦点面板）。"""
+
+        widget = self.tabs_widget.currentWidget()
+
+        if isinstance(widget, SplitTerminalTab):
+            return widget.active_pane()
+
+        if isinstance(widget, SessionTab):
+            return widget
+
+        return None
+
+    def _bind_ai_pane(self) -> None:
+        panel = getattr(self, "ai_panel", None)
+
+        if panel is None:
+            return
+
+        panel.attach_pane(self._current_terminal_pane())
+
+    def toggle_ai_panel(self, visible: bool) -> None:
+        dock = getattr(self, "ai_dock", None)
+
+        if dock is None:
+            return
+
+        dock.setVisible(bool(visible))
+
+        if not visible:
+            return
+
+        self._bind_ai_pane()
+
+        if not self.ai_panel.has_api_key():
+            self.statusBar().showMessage(
+                "AI 助手需要 API Key：点 AI 面板右上角 ⚙，或菜单『AI → AI 设置』", 10000
+            )
+        else:
+            self.ai_panel.input_edit.setFocus()
+
+    def _on_ai_dock_visibility(self, visible: bool) -> None:
+        if self.action_ai.isChecked() != bool(visible):
+            self.action_ai.setChecked(bool(visible))
+
+    def open_ai_settings(self) -> None:
+        if not self.ai_dock.isVisible():
+            self.action_ai.setChecked(True)
+
+        self.ai_panel.open_settings()
+
+    def explain_with_ai(self) -> None:
+        if not self.ai_dock.isVisible():
+            self.action_ai.setChecked(True)
+
+        self._bind_ai_pane()
+        self.ai_panel.explain_output()
+
+    def _run_ai_action(self, name: str) -> bool:
+        """AI 建议的软件操作（pyssh-action）→ 真正执行。"""
+
+        handlers = {
+            "open_sftp": self.open_sftp,
+            "open_forwards": self.open_forwards,
+            "split_horizontal": lambda: self.split_current(Qt.Orientation.Horizontal),
+            "split_vertical": lambda: self.split_current(Qt.Orientation.Vertical),
+            "new_session": self.new_session_for_selected,
+            "reconnect": self.reconnect_current,
+            "sync_input_on": lambda: self.action_sync_input.setChecked(True),
+            "sync_input_off": lambda: self.action_sync_input.setChecked(False),
+            "copy_output": self.copy_all_output,
+            "save_output": self.save_all_output,
+        }
+
+        handler = handlers.get(name)
+
+        if handler is None:
+            return False
+
+        try:
+            handler()
+            return True
+        except Exception as error:  # noqa: BLE001
+            self.statusBar().showMessage(f"AI 操作执行失败：{error}")
+            return False
 
     # ------------------------------------------------------------------
     # 主机列表
@@ -1184,11 +1318,12 @@ class MainWindow(QMainWindow):
 
         self.refresh_hosts()
         self._update_window_title()
+        self._bind_ai_pane()
 
     def open_split_hosts(self, first: Host, second: Host, orientation: Qt.Orientation) -> None:
         """把两台主机摆在同一个标签里（左/上 = first，右/下 = second）。
 
-        这样左边 192.168.206.130、右边 192.168.206.131 可以对比着配环境；
+        这样左边一台、右边另一台可以对比着配环境；
         配合「同步输入」还能两边一起执行同一条命令。
         """
 
@@ -1709,6 +1844,7 @@ class MainWindow(QMainWindow):
 
         self._update_window_title()
         self._sync_command_actions()
+        self._bind_ai_pane()
 
     # ------------------------------------------------------------------
     # 标签管理
@@ -1822,6 +1958,7 @@ class MainWindow(QMainWindow):
             self.action_favorite_selection,
             self.action_copy_output,
             self.action_save_output,
+            self.action_ai_explain,
         ):
             action.setEnabled(has_terminal)
 
@@ -1962,6 +2099,15 @@ class MainWindow(QMainWindow):
         """
 
         self._quitting = True
+
+        # AI 面板的后台线程先停（避免退出阶段线程残留）
+        ai_panel = getattr(self, "ai_panel", None)
+
+        if ai_panel is not None:
+            try:
+                ai_panel.shutdown()
+            except Exception:
+                pass
 
         # 先让所有会话线程停下来（各自会关掉自己的 SSHClient）
         for tab in self._all_host_tabs():

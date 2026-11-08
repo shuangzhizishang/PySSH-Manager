@@ -7,8 +7,9 @@
 - ``hosts``        主机列表持久化（Host / HostStore）
 - ``sshclient``    paramiko 封装（认证、known_hosts 校验、跳板机）
 - ``terminal``     pyte 终端仿真核心 + Qt 字符网格控件
+- ``ai``           DeepSeek AI 助手（配置、客户端、提示词、命令抽取、环境采集）
 - ``ui``           主窗口、侧边栏、会话标签、连接对话框
 """
 
-__version__ = "0.2.4"
+__version__ = "0.3.0"
 APP_NAME = "PySSH Manager"
