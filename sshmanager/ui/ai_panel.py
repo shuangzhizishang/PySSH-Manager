@@ -13,11 +13,13 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut, QTextCursor
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -31,13 +33,32 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..ai import AiConfig, DeepSeekClient, SuggestedCommand, env_api_key, extract_commands
+from ..ai import (
+    AiConfig,
+    DEFAULT_MODEL,
+    DeepSeekClient,
+    EFFORT_CHOICES,
+    EFFORT_LABELS,
+    MODEL_CHOICES,
+    SuggestedCommand,
+    TokenUsage,
+    UsageLedger,
+    canonical_model,
+    cost_of,
+    env_api_key,
+    extract_commands,
+    format_cny,
+    is_peak,
+    model_label,
+    peak_note,
+)
 from ..ai.actions import SuggestedAction, extract_actions, strip_action_blocks
 from ..ai.commands import insert_plan
 from ..ai.config import CREDENTIAL_KEY
 from ..ai.context import DIAGNOSE_COMMAND, terminal_tail
+from ..ai.pricing import CN_TZ, band_name
 from ..ai.prompts import build_context_message, build_system_prompt
-from ..ai.worker import AiCaptureWorker, AiChatWorker, AiEnvWorker
+from ..ai.worker import AiCaptureWorker, AiChatWorker, AiEnvWorker, AiModelsWorker
 
 RISK_COLORS = {"safe": "#3fb950", "careful": "#d29922", "danger": "#f85149"}
 
@@ -166,13 +187,18 @@ class AiPanel(QWidget):
 
         self.context = context
         self.config = AiConfig.load()
+        self.ledger = UsageLedger()
 
         self._pane = None
         self._environment: dict = {}
         self._env_worker = None
         self._capture_worker = None
+        self._models_worker: AiModelsWorker | None = None
+        self._usage_dialog = None
         self._worker: AiChatWorker | None = None
         self._stream_text = ""
+        self._last_usage_text = ""
+        self._model_names: dict[str, str] = {}
         self._transcript: list[dict] = []
         self._watch: dict | None = None
         self._action_handler = None
@@ -201,14 +227,34 @@ class AiPanel(QWidget):
         layout.setSpacing(6)
 
         header = QHBoxLayout()
+        header.setSpacing(4)
         self.target_label = QLabel("目标：未连接")
         self.target_label.setStyleSheet("color: #8b949e; font-size: 11px;")
-        self.model_label = QLabel("")
-        self.model_label.setStyleSheet("color: #58a6ff; font-size: 11px;")
+
+        self.model_combo = QComboBox()
+        self.model_combo.setEditable(True)
+        self.model_combo.setMinimumWidth(140)
+        self.model_combo.setMaximumWidth(190)
+        self.model_combo.setToolTip("模型（切换立即生效；⚙ 里可拉取官方最新模型列表）")
+        self.model_combo.activated.connect(self._on_model_changed)
+        self.model_combo.lineEdit().editingFinished.connect(self._on_model_changed)
+        self._populate_models()
+
+        self.effort_combo = QComboBox()
+        self.effort_combo.setMaximumWidth(140)
+        self.effort_combo.setToolTip(
+            "思考强度：关闭思考最快；强度越高越准但越慢（思考模式下温度不生效）"
+        )
+
+        for key in EFFORT_CHOICES:
+            self.effort_combo.addItem(EFFORT_LABELS.get(key, key), key)
+
+        self.effort_combo.setCurrentIndex(max(0, self.effort_combo.findData(self.config.effort)))
+        self.effort_combo.activated.connect(self._on_effort_changed)
 
         settings_button = QPushButton("⚙")
         settings_button.setFixedWidth(32)
-        settings_button.setToolTip("AI 设置（API Key / 模型 / 接口地址）")
+        settings_button.setToolTip("AI 设置（API Key / 模型 / 接口地址 / 价格）")
         settings_button.clicked.connect(self.open_settings)
 
         clear_button = QPushButton("清空")
@@ -217,10 +263,27 @@ class AiPanel(QWidget):
         clear_button.clicked.connect(self.clear_chat)
 
         header.addWidget(self.target_label, 1)
-        header.addWidget(self.model_label)
+        header.addWidget(self.model_combo)
+        header.addWidget(self.effort_combo)
         header.addWidget(settings_button)
         header.addWidget(clear_button)
         layout.addLayout(header)
+
+        usage_row = QHBoxLayout()
+        usage_row.setSpacing(4)
+        self.usage_label = QLabel("本次还没用过 AI")
+        self.usage_label.setStyleSheet("color: #8b949e; font-size: 11px;")
+        self.usage_label.setToolTip("token 用量 · 缓存命中率 · 估算花费")
+        self._update_usage_label()
+
+        usage_button = QPushButton("用量")
+        usage_button.setFixedWidth(48)
+        usage_button.setToolTip("按模型查看 token、缓存命中率、花费与账户余额")
+        usage_button.clicked.connect(self.open_usage)
+
+        usage_row.addWidget(self.usage_label, 1)
+        usage_row.addWidget(usage_button)
+        layout.addLayout(usage_row)
 
         self.chat_view = QTextBrowser()
         self.chat_view.setOpenExternalLinks(False)
@@ -347,6 +410,7 @@ class AiPanel(QWidget):
 
         if dialog.exec() == AiSettingsDialog.DialogCode.Accepted:
             self.config = AiConfig.load()
+            self._populate_models()
             self._refresh_header()
             self.include_tail.setChecked(self.config.include_terminal_tail > 0)
             self.auto_analyze.setChecked(bool(self.config.auto_analyze_result))
@@ -374,6 +438,14 @@ class AiPanel(QWidget):
         if self._capture_worker is not None:
             self._capture_worker.wait(1500)
             self._capture_worker = None
+
+        if self._models_worker is not None:
+            self._models_worker.wait(1500)
+            self._models_worker = None
+
+        if self._usage_dialog is not None:
+            self._usage_dialog.close()
+            self._usage_dialog = None
 
         if self._watch is not None:
             timer = self._watch.get("timer")
@@ -417,9 +489,215 @@ class AiPanel(QWidget):
 
         return DeepSeekClient(key, self.config)
 
+    # ------------------------------------------------------------------
+    # 模型 / 思考强度 / 用量
+    # ------------------------------------------------------------------
+
+    def _populate_models(self, models: list | None = None) -> None:
+        """填充模型下拉框：默认内置列表，也可以换成 ``GET /models`` 的结果。"""
+
+        combo = getattr(self, "model_combo", None)
+
+        if combo is None:
+            return
+
+        entries: list[str] = []
+
+        for item in models or []:
+            if not isinstance(item, dict):
+                continue
+
+            model_id = str(item.get("id") or "").strip()
+
+            if not model_id:
+                continue
+
+            name = str(item.get("name") or "").strip() or model_label(model_id)
+            self._model_names[model_id] = name
+            entries.append(model_id)
+
+        if not entries:
+            entries = list(MODEL_CHOICES)
+
+        current = (self.config.model or DEFAULT_MODEL).strip()
+
+        if current and current not in entries:
+            entries.insert(0, current)
+
+        combo.blockSignals(True)
+        combo.clear()
+
+        for model_id in entries:
+            label = self._model_names.get(model_id) or model_label(model_id)
+            combo.addItem(label, model_id)
+            combo.setItemData(combo.count() - 1, f"{label} · {model_id}", 3)  # Qt.ToolTipRole
+
+        if current:
+            index = combo.findData(current)
+
+            if index < 0:
+                combo.setEditText(current)
+            else:
+                combo.setCurrentIndex(index)
+
+        combo.blockSignals(False)
+
+    def _sync_model_combo(self) -> None:
+        combo = getattr(self, "model_combo", None)
+
+        if combo is None:
+            return
+
+        combo.blockSignals(True)
+        index = combo.findData(self.config.model)
+
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        else:
+            combo.setEditText(self.config.model)
+
+        combo.blockSignals(False)
+
+    def _on_model_changed(self, *_args) -> None:
+        text = (self.model_combo.currentText() or "").strip()
+
+        # 下拉框显示的是模型名，这里取回模型 id
+        index = self.model_combo.currentIndex()
+        data = self.model_combo.itemData(index) if index >= 0 else None
+
+        if not self.model_combo.isEditable() and data:
+            model = str(data)
+        elif data and text == (self.model_combo.itemText(index) or ""):
+            model = str(data)
+        else:
+            model = canonical_model(text) or text
+
+        if not model or model == self.config.model:
+            return
+
+        self.config.model = model
+        self.config.save()
+        self._update_usage_label()
+
+    def _on_effort_changed(self, *_args) -> None:
+        effort = str(self.effort_combo.currentData() or "").strip()
+
+        if not effort or effort == self.config.effort:
+            return
+
+        self.config.effort = effort
+        self.config.save()
+        self._update_usage_label()
+
+    def reload_models(self, silent: bool = False) -> None:
+        """从 ``GET /models`` 拉官方模型列表（需要有效 API Key）。"""
+
+        client = self._make_client()
+
+        if client is None:
+            if not silent:
+                QMessageBox.information(self, "还没有配置 API Key", "请先在 ⚙ 里填写 API Key。")
+            return
+
+        if self._models_worker is not None:
+            return
+
+        if not silent:
+            self._set_status("正在获取官方模型列表 …", "#8b949e")
+
+        worker = AiModelsWorker(client, self)
+        worker.ok.connect(self._on_models_ready)
+        worker.failed.connect(self._on_models_failed)
+        worker.finished.connect(self._on_models_worker_finished)
+        self._models_worker = worker
+        worker.start()
+
+    def _on_models_ready(self, models: list) -> None:
+        if models:
+            self._populate_models(models)
+            self._set_status(f"已同步 {len(models)} 个官方模型", "#3fb950")
+        else:
+            self._set_status("接口没有返回模型列表", "#d29922")
+
+    def _on_models_failed(self, message: str) -> None:
+        self._set_status(f"模型列表获取失败：{message}", "#d29922")
+
+    def _on_models_worker_finished(self) -> None:
+        self._models_worker = None
+
+    def _price_time(self):
+        """估算花费用的时间点：关掉峰谷计价后固定按空闲价算。"""
+
+        if not self.config.peak_pricing:
+            return datetime(2026, 1, 3, 12, 0, tzinfo=CN_TZ)  # 周六中午 = 空闲档
+
+        return None
+
+    def _on_usage(self, raw) -> None:
+        """收到接口返回的 usage：记账、算钱、刷新顶部一行。"""
+
+        usage = TokenUsage.from_api(raw)
+
+        if usage.is_empty():
+            return
+
+        model = self.config.model or DEFAULT_MODEL
+        moment = self._price_time()
+
+        cost = cost_of(
+            usage.prompt_tokens,
+            usage.cached_tokens,
+            usage.completion_tokens,
+            model,
+            now=moment,
+            prices=self.config.prices,
+        )
+
+        self.ledger.record(model, usage, cost, peak=is_peak(moment))
+        self._last_usage_text = f"{usage.text()} · {format_cny(cost)}"
+        self._update_usage_label()
+
+    def _update_usage_label(self) -> None:
+        label = getattr(self, "usage_label", None)
+
+        if label is None:
+            return
+
+        label.setText(self.ledger.session_line())
+
+        if self.ledger.session.requests:
+            label.setStyleSheet("color: #3fb950; font-size: 11px;")
+        else:
+            label.setStyleSheet("color: #8b949e; font-size: 11px;")
+
+        model = self.config.model or DEFAULT_MODEL
+        label.setToolTip(
+            f"模型：{model_label(model)}（{model}）\n"
+            f"本次：{self.ledger.session.line() if self.ledger.session.requests else '还没用过'}\n"
+            f"累计：{self.ledger.total.line()}\n"
+            f"{peak_note()} · 当前按{band_name() == 'peak' and '高峰' or '空闲'}价估算"
+        )
+
+    def open_usage(self) -> None:
+        from .ai_usage import AiUsageDialog
+
+        dialog = AiUsageDialog(self.ledger, self._make_client, self)
+        self._usage_dialog = dialog
+        dialog.exec()
+        self._usage_dialog = None
+        self._update_usage_label()
+
     def _refresh_header(self) -> None:
-        self.model_label.setText(self.config.model)
-        self.model_label.setToolTip(f"接口：{self.config.normalized_base_url()}")
+        self._sync_model_combo()
+
+        index = self.effort_combo.findData(self.config.effort)
+
+        if index >= 0:
+            self.effort_combo.blockSignals(True)
+            self.effort_combo.setCurrentIndex(index)
+            self.effort_combo.blockSignals(False)
+
+        self._update_usage_label()
 
         if not self._api_key():
             self._set_status("未配置 API Key：点右上角 ⚙ 填写（或设置 PYSSH_AI_API_KEY）", "#d29922")
@@ -494,6 +772,7 @@ class AiPanel(QWidget):
         self._transcript.append({"kind": "user", "text": text})
         self._render_chat()
         self._stream_text = ""
+        self._last_usage_text = ""
         self._clear_cards()
         self._set_busy(True)
 
@@ -502,6 +781,7 @@ class AiPanel(QWidget):
         worker = AiChatWorker(client, messages, self)
         worker.delta.connect(self._on_delta)
         worker.reasoning.connect(self._on_reasoning)
+        worker.usage.connect(self._on_usage)
         worker.finished_ok.connect(self._on_reply)
         worker.failed.connect(self._on_failed)
         worker.finished.connect(self._on_worker_finished)
@@ -544,13 +824,18 @@ class AiPanel(QWidget):
         self._set_status("AI 正在回复 …", "#58a6ff")
 
     def _on_reasoning(self, _text: str) -> None:
-        self._set_status("AI 正在推理（deepseek-reasoner）…", "#d29922")
+        self._set_status(
+            f"AI 正在推理（{EFFORT_LABELS.get(self.config.effort, self.config.effort)}）…",
+            "#d29922",
+        )
 
     def _on_reply(self, text: str) -> None:
         self._transcript.append({"kind": "assistant", "text": text})
         self._render_chat()
         self._build_cards(text)
-        self._set_status(f"收到回复（{len(text)} 字）", "#3fb950")
+
+        suffix = f" · {self._last_usage_text}" if self._last_usage_text else ""
+        self._set_status(f"收到回复（{len(text)} 字）{suffix}", "#3fb950")
 
     def _on_failed(self, message: str) -> None:
         self._transcript.append({"kind": "error", "text": message})

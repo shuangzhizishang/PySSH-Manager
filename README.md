@@ -61,7 +61,10 @@
   包管理器 / 是否 root 等信息，再连着终端尾部输出一起问，所以给的是**这台机器能用的**
   命令；回复里的代码块变成卡片，可「执行 / 插入终端 / 复制」，危险命令二次确认；
   执行完自动把终端输出回传给 AI 分析；还能按一句话操作软件本身（打开 SFTP、
-  左右/上下分屏、开同步输入…）。详见 [AI 助手（DeepSeek）](#ai-助手deepseek)
+  左右/上下分屏、开同步输入…）。
+  **模型可切**（DeepSeek-V4.1-Flash / V4-Pro）**、思考强度可调**（低/高/极高/关闭），
+  面板上直接显示**本次与累计的 token、缓存命中率、估算花费（按官方峰谷价）**，
+  「用量」对话框可按模型看明细、查账户余额。详见 [AI 助手（DeepSeek）](#ai-助手deepseek)
 - **同一主机多会话**：`Ctrl+Shift+N`（或右键「新会话」）可给一台主机开多条并行会话，
   标签按 `(1)(2)(3)` 编号，侧边栏主机条目显示 `×N`（开着的会话数）；
   「连接」在已有会话时只切到该标签，不会重复连接
@@ -123,8 +126,33 @@
    不进 git；地址/模型/温度/最大 token/超时等参数存
    `%APPDATA%\PySSH-Manager\ai_config.json`。
    也支持环境变量 `PYSSH_AI_API_KEY` / `DEEPSEEK_API_KEY`（界面里保存的 Key 优先）。
-4. 默认地址 `https://api.deepseek.com`、模型 `deepseek-chat`；也能填中转/代理地址
-   （填 `https://host/v1` 会自动补成 `/v1/chat/completions`），模型可切 `deepseek-reasoner`。
+4. 默认地址 `https://api.deepseek.com`；也能填中转/代理地址（填 `https://host/v1`
+   会自动补成 `/v1/chat/completions`）。模型下拉默认 `deepseek-flash`
+   （DeepSeek-V4.1-Flash，1M 上下文），可切 `deepseek-v4-pro`（更强也更贵）；
+   点「刷新官方列表」会用 `GET /models` 拉当前真实的模型清单。
+
+### 选模型、看花费
+
+DeepSeek 从 2026-07 起把模型换成了 V4.1：`deepseek-flash`（V4.1-Flash，便宜快）
+和 `deepseek-v4-pro`（更强更贵），旧的 `deepseek-chat` / `deepseek-reasoner`
+已停用（仍可调用，会被自动路由到 Flash，界面上按 Flash 计价）。
+
+- **模型**：面板顶部下拉直接切，切换即保存进配置；也可以手动输入别的模型 id。
+- **思考强度**：`关闭 / 低 / 高 / 极高`。思考模式默认开启（effort=high），会先把
+  推理过程用灰色小字流式显示再给答案；关闭更快、复杂问题略差。
+- **本次用量**：面板顶部一行 `本次 1.5k tok · 命中 75% · ¥0.00168 ｜ 累计 ¥0.0731`，
+  悬停有明细；状态栏的回复提示后面也会带上这次的花费。
+- **用量明细**：点「用量」打开对话框，按模型列出次数、输入、缓存命中、命中率、输出、
+  花费，合计行置顶；还能「查余额」（`GET /user/balance`，显示余额/赠金/充值）、
+  「刷新模型列表」「清零统计」。
+- **花费怎么算**：按官方价目表（元 / 百万 tokens）乘以峰谷系数——北京时间工作日
+  9:00–12:00、14:00–18:00 为高峰，其余时间（含周末与法定节假日）为空闲，空闲价是
+  高峰的一半。命中缓存的输入按「缓存命中价」算，会便宜很多。
+  价格的默认值写在 `sshmanager/ai/pricing.py`；官方调价后可以在
+  `AI 设置 → 价格表` 里直接改（7 列：空闲/高峰 × 命中/未命中/输出），
+  「恢复默认价」可以还原。
+- 用量账本落在 `%APPDATA%\PySSH-Manager\ai_usage.json`（只有 token 数与金额估算，
+  不含对话内容）；「本次」是内存里的会话计数，关掉应用即清零。
 
 ### 能做什么
 
@@ -139,7 +167,8 @@
   复制全部输出、保存输出。
 - **快捷按钮**：诊断机器（磁盘/内存/负载/失败的服务）、装环境（按发行版给整套步骤）、
   磁盘排查；选中终端输出可以让它「解释输出」。
-- **流式输出**：边生成边显示，可「停止」中断；`deepseek-reasoner` 的思考过程以灰色小字显示。
+- **流式输出**：边生成边显示，可「停止」中断；思考模式的推理过程以灰色小字显示，
+  回复结束把这次的 token / 命中率 / 花费写进面板顶部的用量标签。
 
 ### 注意
 
@@ -245,13 +274,15 @@ sshmanager/
   commands.py               命令库：收藏、历史、条目剪贴板与撤销
   ai/
     __init__.py              AI 包对外导出
-    config.py                AI 配置（地址/模型/温度…）与 Key 读取
-    client.py                DeepSeek 客户端（SSE 流式、错误映射、连接测试）
+    config.py                AI 配置（地址/模型/思考强度/价格表…）与 Key 读取
+    pricing.py               官方价目表、峰谷时段判断、费用估算与金额格式化
+    usage.py                 用量账本（token / 缓存命中 / 花费，落盘 ai_usage.json）
+    client.py                DeepSeek 客户端（SSE 流式、模型列表、余额、错误映射）
     prompts.py               系统提示词（发行版手册 + 输出规范 + 软件操作清单）
     commands.py              从回复里抽命令、风险分级、去重
     actions.py               从回复里抽「操作软件」指令
     context.py               采集机器环境（发行版/包管理器/root/容器/虚拟机）
-    worker.py                AI 聊天、测试连接、环境采集的后台线程
+    worker.py                AI 聊天、测试连接、环境采集、模型列表、余额的后台线程
   selftest.py               打包后自检（依赖/资源/界面/本地终端/AI/SSH/SFTP）
   forwarding.py             三类端口转发（-L / -R / SOCKS5 -D）
   terminal/
@@ -264,8 +295,9 @@ sshmanager/
     split_tab.py            分屏容器
     sftp_panel.py           SFTP 双栏面板（含拖拽、递归传输、复制/剪切/粘贴/撤销）
     command_library.py      命令库对话框（收藏 / 历史 / 条目操作）
-    ai_panel.py             AI 面板（聊天、命令卡片、操作卡片、自动分析结果）
-    ai_settings.py          AI 设置对话框（Key、地址、模型、测试连接）
+    ai_panel.py             AI 面板（聊天、命令卡片、操作卡片、模型/用量、自动分析结果）
+    ai_settings.py          AI 设置对话框（Key、模型、思考强度、价格表、测试连接）
+    ai_usage.py             AI 用量对话框（按模型明细、查余额、清零）
     forward_dialog.py       端口转发管理对话框（三种类型）
     key_dialog.py           密钥管理对话框
     replay_dialog.py        录制回放对话框
@@ -288,7 +320,7 @@ tests/
   test_fileops.py           文件剪贴板与撤销栈单测
   test_transfer_progress.py 传输百分比与 ETA 单测
   test_sync_and_ui.py       同步输入、分屏上限、SFTP 过滤/截断单测
-  test_ai.py                AI 单测（命令抽取/风险分级/提示词/配置/SSE 流式解析）
+  test_ai.py                AI 单测（命令抽取/风险分级/提示词/配置/SSE/计费/用量账本/模型与余额接口）
   gui_smoke.py              离屏 GUI 冒烟（不需要联网）
   ai_e2e.py                 AI 面板端到端（本地 mock SSE 服务器 + 截图）
   multi_host_sync_e2e.py    两台主机同步输入端到端
@@ -365,7 +397,7 @@ $env:QT_QPA_PLATFORM='offscreen'
 .venv\Scripts\python.exe tests\two_host_split_e2e.py --host <服务器A> --host2 <服务器B> --password <密码>
 ```
 
-## 十三个已踩过的坑（改动时注意）
+## 十四个已踩过的坑（改动时注意）
 
 1. **必须使用 Fusion 样式**：Qt 6.11 在 Windows 上默认用 `windows11` 原生样式，
    该样式会忽略自定义 `QPainter` 的画笔颜色，终端文字会被画成系统默认文字色，
@@ -440,3 +472,11 @@ $env:QT_QPA_PLATFORM='offscreen'
     （`tests/ai_e2e.py` 曾因此挂住）。测试脚本开头统一
     `sys.stdout.reconfigure(encoding="utf-8", errors="replace")`（stderr 同样处理），
     运行时再加 `PYTHONUTF8=1`、`PYTHONIOENCODING=utf-8`。
+14. **流式请求不传 `stream_options={"include_usage": true}` 就没有用量**：DeepSeek（以及
+    大部分 OpenAI 兼容网关）在 `stream=true` 时默认**不返回** `usage`，必须在请求体里
+    显式要求；返回时它出现在最后一块「`choices` 为空、只有 `usage`」的数据里，
+    所以 SSE 解析不能"看到没有 choices 就 continue"。另外 DeepSeek V4.1 的
+    **思考模式默认开启**，此时 `temperature`/`frequency_penalty` 等参数**不生效也不报错**
+    （传了只是白传）；要降温得先 `thinking={"type": "disabled"}` 或把 effort 设为 `off`。
+    模型名也会变：缓存键、价格表、`/models` 列表都要归一化旧名
+    （`deepseek-chat` → `deepseek-flash`），否则用量会按旧模型分账、查不到价。

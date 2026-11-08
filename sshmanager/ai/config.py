@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .. import settings
@@ -18,10 +18,24 @@ CREDENTIAL_KEY = "ai:deepseek"
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 
-DEFAULT_MODEL = "deepseek-chat"
+#: 2026-10-17 起的默认模型：DeepSeek-V4.1-Flash（deepseek-chat/-reasoner 已停用）
+DEFAULT_MODEL = "deepseek-flash"
 
-#: 官方模型（deepseek-chat = V3 系列，deepseek-reasoner = 推理模型）
-MODEL_CHOICES = ["deepseek-chat", "deepseek-reasoner"]
+#: 官方在售模型；旧名（deepseek-chat / deepseek-v4-flash 等）仍可调用，pricing 里会归一化
+MODEL_CHOICES = [
+    "deepseek-flash",
+    "deepseek-v4-pro",
+]
+
+#: 思考强度（思考模式默认开启，effort 默认 high）
+EFFORT_CHOICES = ["off", "low", "high", "max"]
+
+EFFORT_LABELS = {
+    "off": "关闭思考（最快）",
+    "low": "低",
+    "high": "高（默认）",
+    "max": "极高（最慢最准）",
+}
 
 #: 环境变量兜底（方便脚本/临时使用，不落盘）
 ENV_KEYS = ("PYSSH_AI_API_KEY", "DEEPSEEK_API_KEY")
@@ -53,6 +67,15 @@ class AiConfig:
     max_tokens: int = 2048
     timeout: float = 90.0
 
+    #: 思考强度："off" 关闭思考，"low"/"high"/"max" 开启并指定强度
+    effort: str = "high"
+
+    #: 是否按峰谷价估算花费（空闲时段是高峰价的一半）
+    peak_pricing: bool = True
+
+    #: 自定义价目表（空 = 用内置官方价）：{model: {"idle": {hit,miss,output}, "peak": {...}}}
+    prices: dict = field(default_factory=dict)
+
     #: 提问时附带最近多少行终端输出（0 = 不附带）
     include_terminal_tail: int = 60
 
@@ -61,6 +84,27 @@ class AiConfig:
 
     #: 附在系统提示词后面的额外要求（比如"用中文回答，命令尽量用 yum"）
     system_extra: str = ""
+
+    # ------------------------------------------------------------------
+
+    @property
+    def thinking_enabled(self) -> bool:
+        """思考模式是否开启（对应请求里的 ``thinking`` 字段）。"""
+
+        return self.effort in ("low", "high", "max")
+
+    @property
+    def reasoning_effort(self) -> str | None:
+        """发给接口的 ``reasoning_effort``；关闭思考时为 None。"""
+
+        return self.effort if self.thinking_enabled else None
+
+    def price_table(self) -> dict:
+        """内置官方价 + 用户自定义价的合并结果。"""
+
+        from .pricing import merged_prices
+
+        return merged_prices(self.prices)
 
     # ------------------------------------------------------------------
 
@@ -94,9 +138,35 @@ class AiConfig:
         values = {key: value for key, value in raw.items() if key in known}
 
         try:
-            return cls(**values)
+            return cls(**values).normalized()
         except (TypeError, ValueError):
             return cls()
+
+    # ------------------------------------------------------------------
+
+    def normalized(self) -> "AiConfig":
+        """修掉手改 JSON 后可能出现的不合法值。"""
+
+        if not str(self.model or "").strip():
+            self.model = DEFAULT_MODEL
+
+        if self.effort not in EFFORT_CHOICES:
+            self.effort = "high"
+
+        if not isinstance(self.prices, dict):
+            self.prices = {}
+
+        try:
+            self.max_tokens = max(256, int(self.max_tokens))
+        except (TypeError, ValueError):
+            self.max_tokens = 2048
+
+        try:
+            self.timeout = max(10.0, float(self.timeout))
+        except (TypeError, ValueError):
+            self.timeout = 90.0
+
+        return self
 
     # ------------------------------------------------------------------
 

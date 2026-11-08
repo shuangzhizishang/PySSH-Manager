@@ -131,15 +131,26 @@ def _check_gui(data_dir: Path) -> dict:
 
 
 def _check_ai(data_dir: Path) -> dict:
-    """AI 助手：模块导入、提示词、命令抽取、操作抽取、配置读写（不联网）。"""
+    """AI 助手：模块导入、提示词、命令抽取、操作抽取、计费与用量、配置读写（不联网）。"""
 
     try:
-        from .ai import AiConfig, DeepSeekClient, extract_commands
+        from .ai import (
+            AiConfig,
+            DeepSeekClient,
+            TokenUsage,
+            UsageLedger,
+            cost_of,
+            extract_commands,
+            is_peak,
+        )
         from .ai.actions import extract_actions
         from .ai.context import parse_environment_output
+        from .ai.pricing import CN_TZ
         from .ai.prompts import build_system_prompt
     except Exception as error:  # noqa: BLE001
         return {"ok": False, "detail": f"无法导入 AI 模块：{error}"}
+
+    from datetime import datetime
 
     problems: list[str] = []
 
@@ -201,11 +212,18 @@ def _check_ai(data_dir: Path) -> dict:
 
     # 4) 配置读写（key 不在 JSON 里）
     try:
-        config = AiConfig(model="deepseek-reasoner", temperature=0.5, system_extra="自检")
+        config = AiConfig(
+            model="deepseek-v4-pro", effort="max", peak_pricing=False, temperature=0.5, system_extra="自检"
+        )
         config.save()
         loaded = AiConfig.load()
 
-        if loaded.model != "deepseek-reasoner" or abs(loaded.temperature - 0.5) > 1e-6:
+        if (
+            loaded.model != "deepseek-v4-pro"
+            or loaded.effort != "max"
+            or loaded.peak_pricing
+            or abs(loaded.temperature - 0.5) > 1e-6
+        ):
             problems.append("配置读写不一致")
 
         raw = (Path(data_dir) / "ai_config.json").read_text(encoding="utf-8")
@@ -214,6 +232,47 @@ def _check_ai(data_dir: Path) -> dict:
             problems.append("配置里出现了 api_key（应该只存凭据库）")
     except Exception as error:  # noqa: BLE001
         problems.append(f"配置读写失败：{type(error).__name__}: {error}")
+
+    # 5) 计费与用量（峰谷价、缓存命中、Ledger 记录）
+    try:
+        peak_time = datetime(2026, 10, 12, 10, 0, tzinfo=CN_TZ)  # 周一 10:00 = 高峰
+        idle_time = datetime(2026, 10, 10, 10, 0, tzinfo=CN_TZ)  # 周六 10:00 = 空闲
+
+        if not (is_peak(peak_time) and not is_peak(idle_time)):
+            problems.append("峰谷时段判断异常")
+
+        usage = TokenUsage.from_api(
+            {
+                "prompt_tokens": 1000,
+                "completion_tokens": 500,
+                "total_tokens": 1500,
+                "prompt_cache_hit_tokens": 800,
+                "completion_tokens_details": {"reasoning_tokens": 100},
+            }
+        )
+
+        if usage.cached_tokens != 800 or usage.miss_tokens != 200 or usage.reasoning_tokens != 100:
+            problems.append("usage 解析异常")
+
+        peak_cost = cost_of(1000, 800, 500, "deepseek-flash", now=peak_time)
+        idle_cost = cost_of(1000, 800, 500, "deepseek-flash", now=idle_time)
+
+        if not (peak_cost > 0 and abs(peak_cost - idle_cost * 2) < 1e-9):
+            problems.append(f"费用估算异常：peak={peak_cost} idle={idle_cost}")
+
+        ledger = UsageLedger(path=Path(data_dir) / "ai_usage.json")
+        ledger.reset()
+        ledger.record("deepseek-flash", usage, idle_cost, peak=False)
+
+        if ledger.total.requests != 1 or ledger.total.cached_tokens != 800:
+            problems.append("用量记账异常")
+
+        if not ledger.total.line().startswith("1 次"):
+            problems.append(f"用量文案异常：{ledger.total.line()}")
+
+        ledger.reset()
+    except Exception as error:  # noqa: BLE001
+        problems.append(f"计费自检失败：{type(error).__name__}: {error}")
 
     detail = (
         f"发行版={environment.get('pretty_name', '?')}，包管理器={environment.get('package_managers', '?')}，"

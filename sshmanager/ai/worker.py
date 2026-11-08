@@ -119,3 +119,52 @@ class AiCaptureWorker(QThread):
             self.done.emit(capture_command_output(self._client, self._command))
         except Exception as error:  # noqa: BLE001
             self.done.emit(f"（采集失败：{error}）")
+
+
+class AiModelsWorker(QThread):
+    """拉取官方模型列表（``GET /models``）。"""
+
+    ok = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, client: DeepSeekClient, parent=None) -> None:
+        super().__init__(parent)
+
+        self._client = client
+
+    def run(self) -> None:  # noqa: D102
+        try:
+            models = self._client.list_models()
+        except AiError as error:
+            self.failed.emit(str(error))
+            return
+        except Exception as error:  # noqa: BLE001
+            self.failed.emit(f"出错了：{error}")
+            return
+
+        self.ok.emit(models)
+
+
+class AiBalanceWorker(QThread):
+    """查询账户余额（``GET /user/balance``）。"""
+
+    ok = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, client: DeepSeekClient, parent=None) -> None:
+        super().__init__(parent)
+
+        self._client = client
+
+    def run(self) -> None:  # noqa: D102
+        try:
+            info = self._client.balance()
+        except AiError as error:
+            self.failed.emit(str(error))
+            return
+        except Exception as error:  # noqa: BLE001
+            self.failed.emit(f"出错了：{error}")
+            return
+
+        self.ok.emit(info)
+

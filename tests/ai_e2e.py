@@ -1,4 +1,4 @@
-﻿"""AI 助手界面端到端验证（本地 mock 服务器，不需要真实 API Key）。
+"""AI 助手界面端到端验证（本地 mock 服务器，不需要真实 API Key）。
 
 验证链路：
 1. 主窗口带 AI 停靠面板，输入问题 → 流式回复渲染
@@ -51,10 +51,75 @@ REPLY = (
 
 STATE = {"request": None}
 
+# 官方 /models 的返回结构（只保留自检需要的字段）
+MODELS = [
+    {
+        "id": "deepseek-flash",
+        "name": "DeepSeek-V4.1-Flash-1017",
+        "context_window": 1048576,
+        "max_output_tokens": 393216,
+        "input_modalities": ["text", "image"],
+        "output_modalities": ["text"],
+        "effort": {"supported_levels": ["low", "high", "max"], "default_level": "high"},
+    },
+    {
+        "id": "deepseek-v4-pro",
+        "name": "DeepSeek-V4-Pro-0813",
+        "context_window": 1048576,
+        "max_output_tokens": 393216,
+        "input_modalities": ["text"],
+        "output_modalities": ["text"],
+        "effort": {"supported_levels": ["low", "high", "max"], "default_level": "high"},
+    },
+]
+
+BALANCE = {
+    "is_available": True,
+    "balance_infos": [
+        {
+            "currency": "CNY",
+            "total_balance": "42.50",
+            "granted_balance": "2.50",
+            "topped_up_balance": "40.00",
+        }
+    ],
+}
+
+# 带缓存命中的 usage：命中 900 / 未命中 300
+USAGE = {
+    "prompt_tokens": 1200,
+    "completion_tokens": 340,
+    "total_tokens": 1540,
+    "prompt_cache_hit_tokens": 900,
+    "prompt_cache_miss_tokens": 300,
+    "completion_tokens_details": {"reasoning_tokens": 120},
+}
+
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:  # noqa: D102
         pass
+
+    def do_GET(self) -> None:  # noqa: N802
+        path = self.path.split("?")[0].rstrip("/")
+
+        if path.endswith("/models"):
+            body = {"object": "list", "data": MODELS}
+        elif path.endswith("/user/balance"):
+            body = BALANCE
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        data = json.dumps(body, ensure_ascii=False).encode()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+        self.wfile.flush()
 
     def do_POST(self) -> None:  # noqa: N802
         length = int(self.headers.get("Content-Length") or 0)
@@ -77,7 +142,7 @@ class Handler(BaseHTTPRequestHandler):
                     {
                         "id": "x",
                         "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok，连接正常"}}],
-                        "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+                        "usage": USAGE,
                     },
                     ensure_ascii=False,
                 ).encode()
@@ -90,6 +155,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
 
+        # 先来一小段思维链，再打字
+        thinking = {"choices": [{"index": 0, "delta": {"reasoning_content": "先确认是哪套发行版…"}}]}
+        self.wfile.write(f"data: {json.dumps(thinking, ensure_ascii=False)}\n\n".encode())
+        self.wfile.flush()
+
         # 按 12 个字符切块流式下发，模拟真实打字效果
         for index in range(0, len(REPLY), 12):
             chunk = {"choices": [{"index": 0, "delta": {"content": REPLY[index:index + 12]}}]}
@@ -97,6 +167,9 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             time.sleep(0.01)
 
+        # 真实 API 的最后一个数据块带 usage（choices 为空）
+        final = {"choices": [], "usage": USAGE}
+        self.wfile.write(f"data: {json.dumps(final, ensure_ascii=False)}\n\n".encode())
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
@@ -146,7 +219,7 @@ def main() -> int:
     port = server.server_address[1]
     base_url = f"http://127.0.0.1:{port}"
 
-    AiConfig(base_url=base_url, model="deepseek-chat", timeout=20, auto_analyze_result=False).save()
+    AiConfig(base_url=base_url, model="deepseek-flash", timeout=20, auto_analyze_result=False).save()
 
     app = QApplication(sys.argv[:1])
     app.setStyle("Fusion")
@@ -167,12 +240,19 @@ def main() -> int:
     build_dir = Path(__file__).resolve().parent.parent / "build"
     results = {
         "dock_visible": False,
+        "model_default": False,
         "streamed_reply": False,
+        "payload_thinking": False,
         "command_cards": False,
         "executed_command": False,
         "action_card": False,
+        "usage_recorded": False,
+        "usage_label": False,
         "settings_key_saved": False,
         "settings_test_ok": False,
+        "models_refreshed": False,
+        "usage_dialog": False,
+        "balance_ok": False,
     }
 
     pane = FakePane(host)
@@ -219,12 +299,43 @@ def main() -> int:
         app.processEvents()
         results["dock_visible"] = window.ai_dock.isVisible()
 
+        combo_data = panel.model_combo.currentData()
+        results["model_default"] = (
+            combo_data == "deepseek-flash" and panel.config.model == "deepseek-flash"
+        )
+        print(
+            f"0. 默认模型：{combo_data}（下拉 {panel.model_combo.count()} 项，配置 {panel.config.model}，"
+            f"思考强度 {panel.config.effort}）",
+            flush=True,
+        )
+
         panel.input_edit.setPlainText("帮我在这台机器上装 MySQL 8")
         panel.send()
 
         ok = wait_for(lambda: "MySQL" in panel.chat_view.toPlainText() and "rpm -ivh" in panel.chat_view.toPlainText())
         results["streamed_reply"] = ok
         print(f"1. 流式回复：{ok}", flush=True)
+
+        wait_for(lambda: panel.ledger.total.requests >= 1, timeout=10)
+        total = panel.ledger.total
+        results["usage_recorded"] = bool(
+            total.requests == 1
+            and total.prompt_tokens == 1200
+            and total.cached_tokens == 900
+            and total.completion_tokens == 340
+            and total.cost_cny > 0
+        )
+        label = panel.usage_label.text()
+        results["usage_label"] = bool("tok" in label and "¥" in label and "命中" in label)
+        print(
+            f"   用量标签：{label}",
+            flush=True,
+        )
+        print(
+            f"   记账：请求 {total.requests} 次 · 输入 {total.prompt_tokens}（命中 {total.cached_tokens}）"
+            f" · 输出 {total.completion_tokens} · 估算 ¥{total.cost_cny:.6f}",
+            flush=True,
+        )
 
         QTimer.singleShot(200, step2)
 
@@ -238,6 +349,18 @@ def main() -> int:
         system_prompt = ((body.get("messages") or [{}])[0] or {}).get("content", "")
         print(f"   请求路径：{request.get('path')}，Authorization={request.get('auth')}", flush=True)
         print(f"   系统提示词含 yum：{'yum' in system_prompt}；模型：{body.get('model')}", flush=True)
+
+        results["payload_thinking"] = bool(
+            body.get("reasoning_effort") == "high"
+            and (body.get("thinking") or {}).get("type") == "enabled"
+            and (body.get("stream_options") or {}).get("include_usage") is True
+            and body.get("temperature") is None
+        )
+        print(
+            f"   思考参数：reasoning_effort={body.get('reasoning_effort')} · "
+            f"thinking={body.get('thinking')} · stream_options={body.get('stream_options')}",
+            flush=True,
+        )
 
         command_cards = [widget for widget in cards() if isinstance(widget, CommandCard)]
         print(f"   命令卡片：{[card.command.code.splitlines()[0] for card in command_cards]}", flush=True)
@@ -277,6 +400,19 @@ def main() -> int:
         results["settings_test_ok"] = ok
         print(f"5. 设置对话框测试连接：{ok}（{dialog.status.text()[:60]}）", flush=True)
 
+        dialog.refresh_models()
+        models_ok = wait_for(
+            lambda: dialog.model_combo.findData("deepseek-v4-pro") >= 0 and dialog.model_combo.count() >= 2,
+            timeout=15,
+        )
+        results["models_refreshed"] = models_ok
+        print(f"   官方模型列表：{models_ok}（{dialog.model_combo.count()} 项）", flush=True)
+
+        dialog.resize(640, 700)
+        app.processEvents()
+        dialog.grab().save(str(build_dir / "ai-settings.png"))
+        print(f"   设置对话框截图：{build_dir / 'ai-settings.png'}", flush=True)
+
         dialog.save()
         stored = context.credentials.get(CREDENTIAL_KEY)
         results["settings_key_saved"] = stored == "sk-test-key"
@@ -285,10 +421,29 @@ def main() -> int:
         QTimer.singleShot(200, step5)
 
     def step5() -> None:
+        from sshmanager.ui.ai_usage import AiUsageDialog
+
+        usage_dialog = AiUsageDialog(panel.ledger, panel._make_client, window)
+        usage_dialog.refresh()
+        rows = usage_dialog.table.rowCount()
+        results["usage_dialog"] = rows >= 1
+        print(f"7. 用量明细对话框：{rows} 行", flush=True)
+
+        usage_dialog.refresh_balance()
+        balance_ok = wait_for(lambda: "42.50" in usage_dialog.balance_label.text(), timeout=15)
+        results["balance_ok"] = balance_ok
+        print(f"   余额：{balance_ok}（{usage_dialog.balance_label.text()[:80]}）", flush=True)
+
+        usage_dialog.resize(760, 420)
+        app.processEvents()
+        usage_dialog.grab().save(str(build_dir / "ai-usage.png"))
+        print(f"   用量明细截图：{build_dir / 'ai-usage.png'}", flush=True)
+        usage_dialog.close()
+
         panel.input_edit.setPlainText("接下来还要做什么？")
         app.processEvents()
         window.grab().save(str(build_dir / "ai-panel.png"))
-        print(f"6. 截图：{build_dir / 'ai-panel.png'}", flush=True)
+        print(f"8. 截图：{build_dir / 'ai-panel.png'}", flush=True)
 
         finish()
 
